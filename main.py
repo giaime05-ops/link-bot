@@ -10,30 +10,27 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 def convert_link(text: str) -> str:
-    # 1. Instagram: rimuove i parametri dopo '?' e usa instagramez
-    ig_match = re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|share)/([a-zA-Z0-9_-]+)', text)
-    if ig_match:
-        reel_id = ig_match.group(1)
-        return f"https://www.instagramez.com/reel/{reel_id}/"
+    # 1. Instagram: copre Reel, Post (/p/), Stories e Share
+    if re.search(r'https?://(?:www\.)?instagram\.com/(?:reel|p|stories|share)/', text):
+        clean = text.split('?')[0].strip()
+        return re.sub(r'https?://(?:www\.)?instagram\.com/', 'https://www.eeinstagram.com/', clean)
 
-    # 2. TikTok: usa tnktok al posto del defunto vxtiktok
-    if re.search(r'https?://(?:(?:vt|vm)\.tiktok\.com/|www\.tiktok\.com/)', text):
-        text = re.sub(r'https?://(?:vt|vm)\.tiktok\.com/', 'https://vm.tnktok.com/', text)
-        text = re.sub(r'https?://(?:www\.)?tiktok\.com/', 'https://www.tnktok.com/', text)
-        # Pulisce eventuali parametri alla fine del link
-        clean_url = text.split('?')[0]
-        return clean_url
+    # 2. TikTok: conversione verso tnktok
+    if "tiktok.com" in text:
+        clean = text.split('?')[0].strip()
+        clean = re.sub(r'https?://(?:vt|vm)\.tiktok\.com/', 'https://vm.tnktok.com/', clean)
+        clean = re.sub(r'https?://(?:www\.)?tiktok\.com/', 'https://www.tnktok.com/', clean)
+        return clean
 
-    # 3. Twitter / X: usa fxtwitter
-    x_match = re.search(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/\S+', text)
-    if x_match:
-        url = x_match.group(0).split('?')[0]
-        return re.sub(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/', 'https://fxtwitter.com/', url)
+    # 3. Twitter / X: conversione verso fxtwitter
+    if "twitter.com" in text or "x.com" in text:
+        clean = text.split('?')[0].strip()
+        return re.sub(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/', 'https://fxtwitter.com/', clean)
 
     return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Invia o condividi un link di TikTok, Instagram o X nel gruppo e genererò subito l'anteprima video!")
+    await update.message.reply_text("Invia o condividi un link di TikTok, Instagram o X nel gruppo e genererò subito l'anteprima!")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
