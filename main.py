@@ -3,6 +3,11 @@ import re
 import logging
 import asyncio
 from pathlib import Path
+
+# Carica ffmpeg e ffprobe precompilati nel PATH di sistema
+import static_ffmpeg
+static_ffmpeg.add_paths()
+
 import yt_dlp
 import requests
 from telegram import Update, InputMediaPhoto
@@ -37,7 +42,7 @@ def extract_supported_url(text: str):
     return None
 
 def fetch_instagram_carousel(url: str):
-    """Recupera le immagini dei caroselli Instagram tramite endpoint JSON."""
+    """Recupera le immagini dei caroselli Instagram via API diretta."""
     try:
         api_url = url.replace("instagram.com", "api.ddinstagram.com")
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -47,7 +52,7 @@ def fetch_instagram_carousel(url: str):
         elif res.get("image_versions2"):
             return [res["image_versions2"]["candidates"][0]["url"]]
     except Exception as e:
-        logger.warning(f"Errore recupero API carosello: {e}")
+        logger.warning(f"Errore recupero carosello: {e}")
     return None
 
 def download_media(url: str, audio_only: bool = False):
@@ -67,7 +72,6 @@ def download_media(url: str, audio_only: bool = False):
             }],
         })
     else:
-        # Accetta video o, se assente, immagini/formati alternativi
         ydl_opts.update({
             'format': 'bestvideo+bestaudio/best',
             'extract_flat': False,
@@ -97,7 +101,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = f"👤 Inviato da <b>{sender_name}</b>"
     bot_msg = None
 
-    # Verifica preliminare caroselli foto Instagram
+    # Controllo rapido caroselli foto Instagram
     if "instagram.com" in url:
         photo_urls = fetch_instagram_carousel(url)
         if photo_urls and len(photo_urls) > 1:
@@ -110,13 +114,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 URL_STORE[bot_msg.message_id] = url
                 return
 
-    # Download per video, TikTok e post standard tramite yt-dlp
+    # Download per video, TikTok e post tramite yt-dlp
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(None, download_media, url, False)
 
         if 'entries' in info and info['entries']:
-            # Caroselli rilevati da yt-dlp (es. TikTok Slideshow)
             media_group = []
             files_to_clean = []
             for entry in info['entries']:
@@ -239,7 +242,7 @@ def main():
     app.add_handler(CommandHandler("link", get_link))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Media Bot operativo!")
+    print("Media Bot pronto!")
     app.run_polling()
 
 if __name__ == "__main__":
