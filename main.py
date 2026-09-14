@@ -13,6 +13,7 @@ from telegram.ext import (
     Application,
     MessageHandler,
     CommandHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes
 )
@@ -21,66 +22,59 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Registro in memoria per mappare ID messaggio bot -> URL originale per /link e /audio
 MEDIA_REGISTRY = {}
 
 def clean_url(url: str) -> str:
     return url.split('?')[0].split('&')[0].strip()
 
 def detect_link(text: str):
+    # 1. Instagram
     if "instagram.com" in text:
         match = re.search(r'https?://(?:www\.)?instagram\.com/[^\s]+', text)
         if match:
             clean = clean_url(match.group(0))
-            proxy = re.sub(r'https?://(?:www\.)?instagram\.com/', 'https://www.kkinstagram.com/', clean)
+            proxy = re.sub(r'https?://(?:www\.)?instagram\.com/', 'https://www.ddinstagram.com/', clean)
             return "instagram", clean, proxy
 
+    # 2. TikTok: usa tiktxk/tnktok senza metadati descrittivi invasivi
     if "tiktok.com" in text:
         match = re.search(r'https?://[^\s]*tiktok\.com/[^\s]+', text)
         if match:
             clean = clean_url(match.group(0))
-            proxy = re.sub(r'https?://(?:vt|vm)\.tiktok\.com/', 'https://vm.tnktok.com/', clean)
-            proxy = re.sub(r'https?://(?:www\.)?tiktok\.com/', 'https://www.tnktok.com/', proxy)
+            proxy = re.sub(r'https?://(?:vt|vm)\.tiktok\.com/', 'https://vm.tiktxk.com/', clean)
+            proxy = re.sub(r'https?://(?:www\.)?tiktok\.com/', 'https://www.tiktxk.com/', proxy)
             return "tiktok", clean, proxy
 
+    # 3. Twitter / X: usa vxtwitter per garantire il player video esteso
     if "twitter.com" in text or "x.com" in text:
         match = re.search(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/[^\s]+', text)
         if match:
             clean = clean_url(match.group(0))
-            proxy = re.sub(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/', 'https://fxtwitter.com/', clean)
+            proxy = re.sub(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/', 'https://vxtwitter.com/', clean)
             return "twitter", clean, proxy
 
     return None, None, None
 
-def fetch_carousel_photos(platform: str, orig_url: str):
-    """Interroga l'endpoint JSON dei proxy per verificare se il post è un carosello di foto."""
+def get_carousel_images(platform: str, orig_url: str):
+    """Recupera la lista dei link immagine per i caroselli."""
     try:
         if platform == "tiktok":
-            # API JSON fornita dal proxy fxtiktok/tnktok
-            clean = orig_url.replace("vm.tiktok.com", "api.vxtiktok.com").replace("www.tiktok.com", "api.vxtiktok.com")
-            res = requests.get(clean, timeout=5).json()
+            api_url = orig_url.replace("vm.tiktok.com", "api.vxtiktok.com").replace("www.tiktok.com", "api.vxtiktok.com")
+            res = requests.get(api_url, timeout=5).json()
             if res.get("image_post_info"):
-                images = res["image_post_info"].get("images", [])
-                urls = [img.get("display_image", {}).get("url_list", [None])[0] for img in images]
-                return [u for u in urls if u]
+                imgs = res["image_post_info"].get("images", [])
+                return [img["display_image"]["url_list"][0] for img in imgs if img.get("display_image")]
         elif platform == "instagram":
-            # Endpoint JSON di kkinstagram
-            json_url = orig_url.replace("instagram.com", "kkinstagram.com") + ".json"
-            res = requests.get(json_url, timeout=5).json()
-            items = res.get("carousel_media") or res.get("media")
-            if isinstance(items, list) and len(items) > 1:
-                urls = []
-                for item in items:
-                    if item.get("image_versions2"):
-                        urls.append(item["image_versions2"]["candidates"][0]["url"])
-                if urls:
-                    return urls
+            api_url = orig_url.replace("instagram.com", "api.ddinstagram.com")
+            res = requests.get(api_url, timeout=5).json()
+            if res.get("carousel_media"):
+                return [item["image_versions2"]["candidates"][0]["url"] for item in res["carousel_media"]]
     except Exception as e:
-        logger.warning(f"Controllo carosello non riuscito: {e}")
+        logger.warning(f"Errore recupero carosello: {e}")
     return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Bot attivo! Ora puoi ricevere file multimediali, audio e link in privato.")
+    await update.message.reply_text("👋 Bot attivo! Riceverai qui i tuoi link e tracce audio.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -96,47 +90,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_name = f"@{user.username}" if user and user.username else (user.first_name if user else "Utente")
     chat_id = update.message.chat_id
 
-    # Verifica se si tratta di un carosello di foto sfogliabili
-    photos = fetch_carousel_photos(platform, orig_url)
-    bot_msg = None
+    # Verifica presenza carosello
+    carousel_photos = get_carousel_images(platform, orig_url)
+    keyboard = None
 
-    if photos and len(photos) > 1:
-        # Album nativo Telegram: sfogliabile a schermo intero in-app
-        media_group = [InputMediaPhoto(media=u) for u in photos[:10]]
-        media_group[0].caption = f"👤 Inviato da <b>{sender_name}</b>"
-        media_group[0].parse_mode = "HTML"
-        sent_messages = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-        if sent_messages:
-            bot_msg = sent_messages[0]
-    else:
-        # Link invisibile (Zero-Width Space): solo il player nativo, zero link blu a schermo
-        message_text = f'👤 Inviato da <b>{sender_name}</b><a href="{proxy_url}">&#8203;</a>'
-        bot_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=message_text,
-            parse_mode="HTML",
-            disable_web_page_preview=False
-        )
+    if carousel_photos and len(carousel_photos) > 1:
+        # Se ci sono più foto, predispone i bottoni di scelta rapida
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🖼 Prima foto", callback_data=f"car_one_{chat_id}"),
+                InlineKeyboardButton("📚 Mostra tutte", callback_data=f"car_all_{chat_id}")
+            ]
+        ])
 
-    # Memorizza la relazione per i comandi /link e /audio
+    message_text = f'👤 Inviato da <b>{sender_name}</b><a href="{proxy_url}">&#8203;</a>'
+    bot_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=message_text,
+        parse_mode="HTML",
+        disable_web_page_preview=False,
+        reply_markup=keyboard
+    )
+
     if bot_msg:
         MEDIA_REGISTRY[bot_msg.message_id] = {
             "orig": orig_url,
-            "proxy": proxy_url
+            "proxy": proxy_url,
+            "photos": carousel_photos or [],
+            "sender": sender_name
         }
 
-    # Rimuove il link dell'utente per tenere pulita la chat del gruppo
     try:
         await update.message.delete()
     except Exception:
         pass
+
+async def handle_carousel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestisce la scelta tra 'Prima foto' e 'Mostra tutte'."""
+    query = update.callback_query
+    await query.answer()
+    msg_id = query.message.message_id
+
+    if msg_id not in MEDIA_REGISTRY:
+        return
+
+    data = MEDIA_REGISTRY[msg_id]
+    photos = data.get("photos", [])
+    if not photos:
+        return
+
+    if query.data.startswith("car_one_"):
+        # Mostra solo la prima immagine senza ricaricare altro
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    elif query.data.startswith("car_all_"):
+        # Rimuove i bottoni dal post originale e invia l'album nativo sfogliabile
+        await query.edit_message_reply_markup(reply_markup=None)
+        media_group = [InputMediaPhoto(media=u) for u in photos[:10]]
+        media_group[0].caption = f"📚 Carosello inviato da <b>{data['sender']}</b>"
+        media_group[0].parse_mode = "HTML"
+        await context.bot.send_media_group(chat_id=query.message.chat_id, media=media_group)
 
 async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.reply_to_message
     user = update.message.from_user
     chat_id = update.message.chat_id
 
-    # Cancella subito il comando /audio dal gruppo
     try:
         await update.message.delete()
     except Exception:
@@ -146,35 +165,40 @@ async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = MEDIA_REGISTRY[reply.message_id]
-    # Endpoint audio diretto supportato dal proxy
-    audio_stream_url = f"{data['proxy']}.mp3"
+    audio_url = f"{data['proxy']}.mp3"
 
     try:
-        # Invia il file audio nativo nei DM dell'utente
+        # Tenta invio diretto del file MP3 nei messaggi diretti
         await context.bot.send_audio(
             chat_id=user.id,
-            audio=audio_stream_url,
-            caption="🎵 Ecco la traccia audio estratta dal video!"
+            audio=audio_url,
+            caption="🎵 Traccia audio estratta con successo!"
         )
     except Forbidden:
-        # Se l'utente non ha mai avviato il bot in privato
         bot_info = await context.bot.get_me()
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Avvia Bot in Privato", url=f"https://t.me/{bot_info.username}?start=audio")]
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Clicca qui per abilitare il Bot", url=f"https://t.me/{bot_info.username}?start=audio")]
         ])
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ {user.mention_html()}, per ricevere l'audio in privato devi prima avviare il bot cliccando qui sotto:",
+            text=f"⚠️ {user.mention_html()}, avvia il bot in privato per ricevere i file audio:",
             parse_mode="HTML",
-            reply_markup=keyboard
+            reply_markup=btn
         )
+    except Exception as e:
+        logger.error(f"Errore caricamento audio: {e}")
+        # Fallback: invio del file audio nativo tramite proxy secondario
+        alt_audio = data['orig'].replace("tiktok.com", "vxtiktok.com") + ".mp3"
+        try:
+            await context.bot.send_audio(chat_id=user.id, audio=alt_audio)
+        except Exception:
+            pass
 
 async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.reply_to_message
     user = update.message.from_user
     chat_id = update.message.chat_id
 
-    # Cancella subito il comando /link dal gruppo
     try:
         await update.message.delete()
     except Exception:
@@ -184,23 +208,21 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = MEDIA_REGISTRY[reply.message_id]
-
     try:
-        # Invia il link originale in privato
         await context.bot.send_message(
             chat_id=user.id,
-            text=f"🔗 Ecco il link originale del post:\n{data['orig']}"
+            text=f"🔗 Link originale:\n{data['orig']}"
         )
     except Forbidden:
         bot_info = await context.bot.get_me()
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Avvia Bot in Privato", url=f"https://t.me/{bot_info.username}?start=link")]
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Clicca qui per abilitare il Bot", url=f"https://t.me/{bot_info.username}?start=link")]
         ])
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ {user.mention_html()}, per ricevere il link in privato devi prima avviare il bot cliccando qui sotto:",
+            text=f"⚠️ {user.mention_html()}, avvia il bot in privato per ricevere i link:",
             parse_mode="HTML",
-            reply_markup=keyboard
+            reply_markup=btn
         )
 
 def main():
@@ -211,9 +233,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("audio", get_audio))
     app.add_handler(CommandHandler("link", get_link))
+    app.add_handler(CallbackQueryHandler(handle_carousel_buttons, pattern=r"^car_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Embed Fixer Bot avanzato operativo!")
+    print("Media Bot aggiornato operativo!")
     app.run_polling()
 
 if __name__ == "__main__":
