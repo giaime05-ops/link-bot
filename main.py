@@ -3,11 +3,12 @@ import re
 import logging
 import asyncio
 from pathlib import Path
+
 import static_ffmpeg
 static_ffmpeg.add_paths()
 
 import yt_dlp
-import requests
+import instaloader
 from telegram import Update, InputMediaPhoto
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
@@ -27,6 +28,17 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 URL_STORE = {}
 
+# Inizializza Instaloader (anonimo, senza login)
+L = instaloader.Instaloader(
+    download_pictures=False,
+    download_videos=False,
+    download_video_thumbnails=False,
+    download_geotags=False,
+    download_comments=False,
+    save_metadata=False,
+    quiet=True
+)
+
 def extract_supported_url(text: str):
     patterns = [
         r'https?://(?:www\.)?instagram\.com/[^\s]+',
@@ -39,39 +51,33 @@ def extract_supported_url(text: str):
             return m.group(0).split('?')[0]
     return None
 
-def fetch_instagram_media(url: str):
-    """Tenta l'estrazione delle immagini tramite il proxy aperto InstaFix."""
-    clean_path = url.replace("https://www.instagram.com/", "").replace("https://instagram.com/", "")
-    api_url = f"https://ddinstagram.com/{clean_path}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+def extract_instagram_shortcode(url: str) -> str:
+    """Estrae lo shortcode da link come /p/SHORTCODE/ o /reel/SHORTCODE/."""
+    m = re.search(r'instagram\.com/(?:p|reel|tv)/([^/?#&]+)', url)
+    return m.group(1) if m else None
+
+def get_instagram_photos(shortcode: str):
+    """Estrae gli URL diretti delle foto da post singoli o caroselli tramite Instaloader."""
     try:
-        # Molti proxy forniscono i metadati open-graph pronti
-        res = requests.get(api_url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            # Trova le immagini nel tag og:image dell'embed
-            images = re.findall(r'<meta property="og:image" content="([^"]+)"', res.text)
-            # Rimuove le miniature generiche o logo
-            valid_images = [img for img in images if "static" not in img and "icon" not in img]
-            if valid_images:
-                return valid_images
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        if post.is_video:
+            return None  # I video vengono gestiti da yt-dlp
+
+        # Carosello di immagini
+        if post.mediacount > 1:
+            photos = []
+            for node in post.get_sidecar_nodes():
+                if not node.is_video:
+                    photos.append(node.display_url)
+            return photos if photos else None
+
+        # Singola immagine
+        return [post.url]
     except Exception as e:
-        logger.warning(f"Errore scraping carosello proxy: {e}")
-    return None
+        logger.warning(f"Instaloader fallito per shortcode {shortcode}: {e}")
+        return None
 
-def fetch_tiktok_slideshow(url: str):
-    """Estrae foto da caroselli/slideshow di TikTok."""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    clean = url.replace("vm.tiktok.com", "api.vxtiktok.com").replace("www.tiktok.com", "api.vxtiktok.com")
-    try:
-        res = requests.get(clean, headers=headers, timeout=4).json()
-        if res.get("image_post_info"):
-            imgs = res["image_post_info"].get("images", [])
-            return [img["display_image"]["url_list"][0] for img in imgs if img.get("display_image")]
-    except Exception:
-        pass
-    return None
-
-def download_media(url: str, audio_only: bool = False):
+def download_video_or_audio(url: str, audio_only: bool = False):
     ydl_opts = {
         'outtmpl': f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
         'quiet': True,
@@ -90,7 +96,6 @@ def download_media(url: str, audio_only: bool = False):
             }],
         })
     else:
-        # Se non c'è MP4 accetta qualsiasi formato disponibile
         ydl_opts.update({
             'format': 'best[ext=mp4]/bestvideo+bestaudio/best',
         })
@@ -119,44 +124,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = f"👤 Inviato da <b>{sender_name}</b>"
     bot_msg = None
 
-    # 1. Caroselli Foto TikTok
-    if "tiktok.com" in url:
-        tt_photos = fetch_tiktok_slideshow(url)
-        if tt_photos and len(tt_photos) > 1:
-            media_group = [InputMediaPhoto(media=u) for u in tt_photos[:10]]
-            media_group[0].caption = caption
-            media_group[0].parse_mode = "HTML"
-            sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-            if sent:
-                URL_STORE[sent[0].message_id] = url
-                return
+    # 1. Gestione Foto / Caroselli Instagram tramite Instaloader
+    if "instagram.com" in url:
+        shortcode = extract_instagram_shortcode(url)
+        if shortcode:
+            loop = asyncio.get_running_loop()
+            photos = await loop.run_in_executor(None, get_instagram_photos, shortcode)
 
-    # 2. Caroselli / Foto Instagram
-    if "instagram.com" in url and ("/p/" in url or "/reel/" not in url):
-        ig_photos = fetch_instagram_media(url)
-        if ig_photos and len(ig_photos) > 1:
-            media_group = [InputMediaPhoto(media=u) for u in ig_photos[:10]]
-            media_group[0].caption = caption
-            media_group[0].parse_mode = "HTML"
-            sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-            if sent:
-                URL_STORE[sent[0].message_id] = url
-                return
-        elif ig_photos and len(ig_photos) == 1:
-            bot_msg = await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=ig_photos[0],
-                caption=caption,
-                parse_mode="HTML"
-            )
-            if bot_msg:
-                URL_STORE[bot_msg.message_id] = url
-                return
+            if photos:
+                if len(photos) > 1:
+                    media_group = [InputMediaPhoto(media=u) for u in photos[:10]]
+                    media_group[0].caption = caption
+                    media_group[0].parse_mode = "HTML"
+                    sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+                    if sent:
+                        URL_STORE[sent[0].message_id] = url
+                    return
+                elif len(photos) == 1:
+                    bot_msg = await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photos[0],
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+                    if bot_msg:
+                        URL_STORE[bot_msg.message_id] = url
+                    return
 
-    # 3. Video (TikTok, Reels, X) tramite download nativo veloce
+    # 2. Gestione Video (TikTok, Reels, Twitter/X) tramite yt-dlp
     loop = asyncio.get_running_loop()
     try:
-        info = await loop.run_in_executor(None, download_media, url, False)
+        info = await loop.run_in_executor(None, download_video_or_audio, url, False)
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
 
@@ -183,30 +181,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if bot_msg:
             URL_STORE[bot_msg.message_id] = url
-            return
 
     except Exception as e:
-        logger.warning(f"Download nativo non riuscito, avvio fallback automatico: {e}")
-
-    # 4. Fallback pulito (se Meta o X bloccano il download del file)
-    # Genera la visualizzazione del post senza crash
-    fallback_url = url
-    if "instagram.com" in url:
-        fallback_url = re.sub(r'https?://(?:www\.)?instagram\.com/', 'https://www.ddinstagram.com/', url)
-    elif "tiktok.com" in url:
-        fallback_url = re.sub(r'https?://(?:vt|vm)\.tiktok\.com/', 'https://vm.tnktok.com/', url)
-    elif "twitter.com" in url or "x.com" in url:
-        fallback_url = re.sub(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/', 'https://vxtwitter.com/', url)
-
-    # Invia usando il link con anteprima automatica
-    bot_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"{caption}\n{fallback_url}",
-        parse_mode="HTML",
-        disable_web_page_preview=False
-    )
-    if bot_msg:
-        URL_STORE[bot_msg.message_id] = url
+        logger.error(f"Errore caricamento per {url}: {e}")
 
 async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.reply_to_message
@@ -224,7 +201,7 @@ async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
 
     try:
-        info = await loop.run_in_executor(None, download_media, url, True)
+        info = await loop.run_in_executor(None, download_video_or_audio, url, True)
         file_id = info.get('id')
         audio_files = list(DOWNLOAD_DIR.glob(f"{file_id}.mp3"))
 
@@ -274,14 +251,14 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN non impostato!")
+        raise ValueError("TELEGRAM_TOKEN mancante!")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("audio", get_audio))
     app.add_handler(CommandHandler("link", get_link))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Media Bot definitivo attivo!")
+    print("Bot ibrido operativo!")
     app.run_polling()
 
 if __name__ == "__main__":
