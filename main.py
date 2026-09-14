@@ -82,10 +82,6 @@ def get_instagram_photos(shortcode: str):
         return None
 
 def get_twitter_photos_and_text(url: str):
-    """
-    Estrae foto e testo per tweet senza video via endpoint API pubblico.
-    Non richiede credenziali o cookie.
-    """
     try:
         clean_url = url.replace("https://x.com/", "https://api.vxtwitter.com/").replace("https://twitter.com/", "https://api.vxtwitter.com/")
         resp = requests.get(clean_url, timeout=10)
@@ -99,6 +95,25 @@ def get_twitter_photos_and_text(url: str):
     except Exception as e:
         logger.warning(f"Errore fallback foto Twitter: {e}")
     return None, None
+
+def get_tiktok_photos(url: str):
+    """
+    Risolve i caroselli fotografici di TikTok (endpoint /photo/) tramite TikWM.
+    Restituisce la lista di immagini se si tratta di uno slideshow.
+    """
+    try:
+        api_url = "https://www.tikwm.com/api/"
+        resp = requests.post(api_url, data={"url": url}, timeout=10)
+        if resp.status_code == 200:
+            res = resp.json()
+            if res.get("code") == 0:
+                data = res.get("data", {})
+                images = data.get("images", [])
+                if images:
+                    return images
+    except Exception as e:
+        logger.warning(f"Errore fallback TikTok photo: {e}")
+    return None
 
 def download_video_or_audio(url: str, audio_only: bool = False):
     ydl_opts = {
@@ -122,22 +137,12 @@ def download_video_or_audio(url: str, audio_only: bool = False):
             }],
         })
     else:
-        # Include formati fallback anche se il post non ha mp4 espliciti
         ydl_opts.update({
             'format': 'best[ext=mp4]/bestvideo+bestaudio/best',
         })
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=True)
-
-def extract_metadata_only(url: str):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -159,7 +164,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_running_loop()
 
-    # 1. Caroselli / Foto Instagram (Instaloader + Cookies)
+    # 1. Caroselli / Foto Instagram
     if "instagram.com" in url and ("/p/" in url or "/reel/" not in url):
         shortcode = extract_instagram_shortcode(url)
         if shortcode:
@@ -188,52 +193,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         URL_STORE[bot_msg.message_id] = url
                     return
 
-    # 2. Controllo specifico Foto TikTok (Photo Mode)
+    # 2. Controllo Foto e Caroselli TikTok
     if "tiktok.com" in url:
-        try:
-            info_meta = await loop.run_in_executor(None, extract_metadata_only, url)
-            entries = info_meta.get("entries")
-            formats = info_meta.get("formats", [])
-            has_video_stream = any(f.get("vcodec") and f.get("vcodec") != "none" for f in formats)
-
-            # Se è uno slideshow fotografico
-            if not has_video_stream or entries:
-                photo_urls = []
-                if entries:
-                    for entry in entries:
-                        if entry.get("url"):
-                            photo_urls.append(entry["url"])
-                elif info_meta.get("thumbnails"):
-                    # Filtra solo i thumbnail ad alta risoluzione del post fotografico
-                    thumbs = [t.get("url") for t in info_meta.get("thumbnails", []) if t.get("url")]
-                    if thumbs:
-                        photo_urls = thumbs[:10]
-
-                if photo_urls:
-                    caption = f"👤 Inviato da <b>{sender_name}</b>"
-                    if len(photo_urls) > 1:
-                        media_group = [
-                            InputMediaPhoto(media=photo_urls[0], caption=caption, parse_mode="HTML")
-                        ] + [
-                            InputMediaPhoto(media=u) for u in photo_urls[1:10]
-                        ]
-                        sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-                        if sent:
-                            for msg in sent:
-                                URL_STORE[msg.message_id] = url
-                        return
-                    elif len(photo_urls) == 1:
-                        bot_msg = await context.bot.send_photo(
-                            chat_id=chat_id,
-                            photo=photo_urls[0],
-                            caption=caption,
-                            parse_mode="HTML"
-                        )
-                        if bot_msg:
-                            URL_STORE[bot_msg.message_id] = url
-                        return
-        except Exception as e:
-            logger.info(f"Non è un set foto TikTok puro o fallback al downloader standard: {e}")
+        tiktok_photos = await loop.run_in_executor(None, get_tiktok_photos, url)
+        if tiktok_photos:
+            caption = f"👤 Inviato da <b>{sender_name}</b>"
+            if len(tiktok_photos) > 1:
+                media_group = [
+                    InputMediaPhoto(media=tiktok_photos[0], caption=caption, parse_mode="HTML")
+                ] + [
+                    InputMediaPhoto(media=u) for u in tiktok_photos[1:10]
+                ]
+                sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+                if sent:
+                    for msg in sent:
+                        URL_STORE[msg.message_id] = url
+                return
+            elif len(tiktok_photos) == 1:
+                bot_msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=tiktok_photos[0],
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+                if bot_msg:
+                    URL_STORE[bot_msg.message_id] = url
+                return
 
     # 3. Controllo Foto X / Twitter
     if "twitter.com" in url or "x.com" in url:
@@ -267,7 +252,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 4. Download Video (TikTok, Reels, Twitter/X video)
+    # 4. Download Video standard (TikTok video, Reels, Twitter/X video)
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, False)
         file_id = info.get('id')
@@ -397,7 +382,7 @@ def main():
     app.add_handler(CommandHandler("link", get_link))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot avviato con supporto foto e video completo!")
+    print("Bot avviato con supporto foto TikTok e Twitter attivo!")
     app.run_polling()
 
 if __name__ == "__main__":
