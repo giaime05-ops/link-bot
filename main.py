@@ -30,7 +30,6 @@ COOKIE_FILE = "cookies.txt"
 
 URL_STORE = {}
 
-# Configura Instaloader con il supporto ai cookies
 L = instaloader.Instaloader(
     download_pictures=False,
     download_videos=False,
@@ -46,9 +45,9 @@ if os.path.exists(COOKIE_FILE):
         cj = http.cookiejar.MozillaCookieJar(COOKIE_FILE)
         cj.load(ignore_discard=True, ignore_expires=True)
         L.context._session.cookies = cj
-        logger.info("Sessione cookies Instagram caricata con successo in Instaloader!")
+        logger.info("Sessione cookies caricata in Instaloader.")
     except Exception as e:
-        logger.warning(f"Impossibile caricare cookies in Instaloader: {e}")
+        logger.warning(f"Errore caricamento cookies: {e}")
 
 def extract_supported_url(text: str):
     patterns = [
@@ -78,7 +77,7 @@ def get_instagram_photos(shortcode: str):
 
         return [post.url]
     except Exception as e:
-        logger.warning(f"Instaloader non è riuscito ad accedere al post {shortcode}: {e}")
+        logger.warning(f"Errore Instaloader: {e}")
         return None
 
 def download_video_or_audio(url: str, audio_only: bool = False):
@@ -90,7 +89,7 @@ def download_video_or_audio(url: str, audio_only: bool = False):
         'concurrent_fragment_downloads': 5,
     }
 
-    if os.path.exists(COOKIE_FILE):
+    if os.path.exists(COOKIE_FILE) and "instagram.com" in url:
         ydl_opts['cookiefile'] = COOKIE_FILE
 
     if audio_only:
@@ -128,8 +127,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
-    caption = f"👤 Inviato da <b>{sender_name}</b>"
-
     # 1. Caroselli / Foto Instagram
     if "instagram.com" in url and ("/p/" in url or "/reel/" not in url):
         shortcode = extract_instagram_shortcode(url)
@@ -138,6 +135,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photos = await loop.run_in_executor(None, get_instagram_photos, shortcode)
 
             if photos:
+                caption = f"👤 Inviato da <b>{sender_name}</b>"
                 if len(photos) > 1:
                     media_group = [
                         InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
@@ -146,7 +144,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ]
                     sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
                     if sent:
-                        URL_STORE[sent[0].message_id] = url
+                        for msg in sent:
+                            URL_STORE[msg.message_id] = url
                     return
                 elif len(photos) == 1:
                     bot_msg = await context.bot.send_photo(
@@ -159,13 +158,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         URL_STORE[bot_msg.message_id] = url
                     return
 
-    # 2. Video e Reels tramite yt-dlp
+    # 2. Video (TikTok, Reels, Twitter/X)
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, False)
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
 
+        # Estrae il testo solo se si tratta di un tweet di X/Twitter
+        is_twitter = ("twitter.com" in url or "x.com" in url)
+        tweet_text = info.get('description') or info.get('title') or ""
+
+        if is_twitter and tweet_text and tweet_text != file_id:
+            # Pulisce eventuali link interni al tweet
+            clean_tweet = re.sub(r'https?://\S+', '', tweet_text).strip()
+            if clean_tweet:
+                caption = f"💬 <i>{clean_tweet}</i>\n\n👤 Inviato da <b>{sender_name}</b>"
+            else:
+                caption = f"👤 Inviato da <b>{sender_name}</b>"
+        else:
+            caption = f"👤 Inviato da <b>{sender_name}</b>"
+
+        bot_msg = None
         if files:
             actual_file = files[0]
             ext = actual_file.suffix.lower().replace('.', '')
@@ -192,7 +206,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     except Exception as e:
-        logger.error(f"Errore download per {url}: {e}")
+        logger.error(f"Errore download {url}: {e}")
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"⚠️ Impossibile scaricare il contenuto da questo link.",
@@ -227,6 +241,11 @@ async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption="🎵 Traccia audio estratta!"
                 )
             audio_files[0].unlink(missing_ok=True)
+        else:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="ℹ️ Nessuna traccia audio disponibile per questo post."
+            )
     except Forbidden:
         bot_info = await context.bot.get_me()
         await context.bot.send_message(
@@ -272,7 +291,7 @@ def main():
     app.add_handler(CommandHandler("link", get_link))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot avviato con supporto cookies!")
+    print("Bot avviato con didascalie X attive!")
     app.run_polling()
 
 if __name__ == "__main__":
