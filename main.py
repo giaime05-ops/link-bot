@@ -3,6 +3,7 @@ import re
 import logging
 import asyncio
 from pathlib import Path
+import http.cookiejar
 
 import static_ffmpeg
 static_ffmpeg.add_paths()
@@ -25,10 +26,11 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+COOKIE_FILE = "cookies.txt"
 
 URL_STORE = {}
 
-# Inizializza Instaloader (anonimo, senza login)
+# Configura Instaloader con il supporto ai cookies
 L = instaloader.Instaloader(
     download_pictures=False,
     download_videos=False,
@@ -38,6 +40,15 @@ L = instaloader.Instaloader(
     save_metadata=False,
     quiet=True
 )
+
+if os.path.exists(COOKIE_FILE):
+    try:
+        cj = http.cookiejar.MozillaCookieJar(COOKIE_FILE)
+        cj.load(ignore_discard=True, ignore_expires=True)
+        L.context._session.cookies = cj
+        logger.info("Sessione cookies Instagram caricata con successo in Instaloader!")
+    except Exception as e:
+        logger.warning(f"Impossibile caricare cookies in Instaloader: {e}")
 
 def extract_supported_url(text: str):
     patterns = [
@@ -52,29 +63,22 @@ def extract_supported_url(text: str):
     return None
 
 def extract_instagram_shortcode(url: str) -> str:
-    """Estrae lo shortcode da link come /p/SHORTCODE/ o /reel/SHORTCODE/."""
     m = re.search(r'instagram\.com/(?:p|reel|tv)/([^/?#&]+)', url)
     return m.group(1) if m else None
 
 def get_instagram_photos(shortcode: str):
-    """Estrae gli URL diretti delle foto da post singoli o caroselli tramite Instaloader."""
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         if post.is_video:
-            return None  # I video vengono gestiti da yt-dlp
+            return None
 
-        # Carosello di immagini
         if post.mediacount > 1:
-            photos = []
-            for node in post.get_sidecar_nodes():
-                if not node.is_video:
-                    photos.append(node.display_url)
+            photos = [node.display_url for node in post.get_sidecar_nodes() if not node.is_video]
             return photos if photos else None
 
-        # Singola immagine
         return [post.url]
     except Exception as e:
-        logger.warning(f"Instaloader fallito per shortcode {shortcode}: {e}")
+        logger.warning(f"Instaloader non è riuscito ad accedere al post {shortcode}: {e}")
         return None
 
 def download_video_or_audio(url: str, audio_only: bool = False):
@@ -85,6 +89,9 @@ def download_video_or_audio(url: str, audio_only: bool = False):
         'noplaylist': True,
         'concurrent_fragment_downloads': 5,
     }
+
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts['cookiefile'] = COOKIE_FILE
 
     if audio_only:
         ydl_opts.update({
@@ -122,10 +129,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     caption = f"👤 Inviato da <b>{sender_name}</b>"
-    bot_msg = None
 
-    # 1. Gestione Foto / Caroselli Instagram tramite Instaloader
-    if "instagram.com" in url:
+    # 1. Caroselli / Foto Instagram
+    if "instagram.com" in url and ("/p/" in url or "/reel/" not in url):
         shortcode = extract_instagram_shortcode(url)
         if shortcode:
             loop = asyncio.get_running_loop()
@@ -133,9 +139,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if photos:
                 if len(photos) > 1:
-                    media_group = [InputMediaPhoto(media=u) for u in photos[:10]]
-                    media_group[0].caption = caption
-                    media_group[0].parse_mode = "HTML"
+                    media_group = [
+                        InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
+                    ] + [
+                        InputMediaPhoto(media=u) for u in photos[1:10]
+                    ]
                     sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
                     if sent:
                         URL_STORE[sent[0].message_id] = url
@@ -151,7 +159,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         URL_STORE[bot_msg.message_id] = url
                     return
 
-    # 2. Gestione Video (TikTok, Reels, Twitter/X) tramite yt-dlp
+    # 2. Video e Reels tramite yt-dlp
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, False)
@@ -181,9 +189,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if bot_msg:
             URL_STORE[bot_msg.message_id] = url
+            return
 
     except Exception as e:
-        logger.error(f"Errore caricamento per {url}: {e}")
+        logger.error(f"Errore download per {url}: {e}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Impossibile scaricare il contenuto da questo link.",
+            parse_mode="HTML"
+        )
 
 async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.reply_to_message
@@ -221,7 +235,7 @@ async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     except Exception as e:
-        logger.error(f"Errore invio audio: {e}")
+        logger.error(f"Errore estrazione audio: {e}")
 
 async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.reply_to_message
@@ -258,7 +272,7 @@ def main():
     app.add_handler(CommandHandler("link", get_link))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot ibrido operativo!")
+    print("Bot avviato con supporto cookies!")
     app.run_polling()
 
 if __name__ == "__main__":
