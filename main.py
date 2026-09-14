@@ -40,25 +40,22 @@ def extract_supported_url(text: str):
     return None
 
 def fetch_instagram_media(url: str):
-    """Estrae immagini/caroselli Instagram tramite proxy API senza blocco login."""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    # Corretto: api.ddinstagram.com senza www
-    clean = re.sub(r'https?://(?:www\.)?instagram\.com/', 'https://api.ddinstagram.com/', url)
+    """Tenta l'estrazione delle immagini tramite il proxy aperto InstaFix."""
+    clean_path = url.replace("https://www.instagram.com/", "").replace("https://instagram.com/", "")
+    api_url = f"https://ddinstagram.com/{clean_path}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        res = requests.get(clean, headers=headers, timeout=5).json()
-        # Se è un carosello
-        if res.get("carousel_media"):
-            photos = []
-            for item in res["carousel_media"]:
-                if item.get("image_versions2"):
-                    photos.append(item["image_versions2"]["candidates"][0]["url"])
-            if photos:
-                return photos
-        # Se è un singolo post foto
-        elif res.get("image_versions2"):
-            return [res["image_versions2"]["candidates"][0]["url"]]
+        # Molti proxy forniscono i metadati open-graph pronti
+        res = requests.get(api_url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            # Trova le immagini nel tag og:image dell'embed
+            images = re.findall(r'<meta property="og:image" content="([^"]+)"', res.text)
+            # Rimuove le miniature generiche o logo
+            valid_images = [img for img in images if "static" not in img and "icon" not in img]
+            if valid_images:
+                return valid_images
     except Exception as e:
-        logger.warning(f"Errore recupero API Instagram: {e}")
+        logger.warning(f"Errore scraping carosello proxy: {e}")
     return None
 
 def fetch_tiktok_slideshow(url: str):
@@ -66,16 +63,15 @@ def fetch_tiktok_slideshow(url: str):
     headers = {"User-Agent": "Mozilla/5.0"}
     clean = url.replace("vm.tiktok.com", "api.vxtiktok.com").replace("www.tiktok.com", "api.vxtiktok.com")
     try:
-        res = requests.get(clean, headers=headers, timeout=5).json()
+        res = requests.get(clean, headers=headers, timeout=4).json()
         if res.get("image_post_info"):
             imgs = res["image_post_info"].get("images", [])
             return [img["display_image"]["url_list"][0] for img in imgs if img.get("display_image")]
-    except Exception as e:
-        logger.warning(f"Errore recupero API TikTok: {e}")
+    except Exception:
+        pass
     return None
 
 def download_media(url: str, audio_only: bool = False):
-    """Esegue download ottimizzato con yt-dlp per ridurre al minimo la latenza."""
     ydl_opts = {
         'outtmpl': f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
         'quiet': True,
@@ -94,6 +90,7 @@ def download_media(url: str, audio_only: bool = False):
             }],
         })
     else:
+        # Se non c'è MP4 accetta qualsiasi formato disponibile
         ydl_opts.update({
             'format': 'best[ext=mp4]/bestvideo+bestaudio/best',
         })
@@ -114,7 +111,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_name = f"@{user.username}" if user and user.username else (user.first_name if user else "Utente")
     chat_id = update.message.chat_id
 
-    # Elimina subito il messaggio con il link per pulizia chat
     try:
         await update.message.delete()
     except TelegramError:
@@ -123,29 +119,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = f"👤 Inviato da <b>{sender_name}</b>"
     bot_msg = None
 
-    # 1. Controllo caroselli o post foto Instagram
-    if "instagram.com" in url:
-        ig_photos = fetch_instagram_media(url)
-        if ig_photos:
-            if len(ig_photos) > 1:
-                media_group = [InputMediaPhoto(media=u) for u in ig_photos[:10]]
-                media_group[0].caption = caption
-                media_group[0].parse_mode = "HTML"
-                sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-                if sent:
-                    bot_msg = sent[0]
-            else:
-                bot_msg = await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=ig_photos[0],
-                    caption=caption,
-                    parse_mode="HTML"
-                )
-            if bot_msg:
-                URL_STORE[bot_msg.message_id] = url
-                return
-
-    # 2. Controllo slideshow/caroselli foto TikTok
+    # 1. Caroselli Foto TikTok
     if "tiktok.com" in url:
         tt_photos = fetch_tiktok_slideshow(url)
         if tt_photos and len(tt_photos) > 1:
@@ -154,11 +128,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_group[0].parse_mode = "HTML"
             sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
             if sent:
-                bot_msg = sent[0]
+                URL_STORE[sent[0].message_id] = url
+                return
+
+    # 2. Caroselli / Foto Instagram
+    if "instagram.com" in url and ("/p/" in url or "/reel/" not in url):
+        ig_photos = fetch_instagram_media(url)
+        if ig_photos and len(ig_photos) > 1:
+            media_group = [InputMediaPhoto(media=u) for u in ig_photos[:10]]
+            media_group[0].caption = caption
+            media_group[0].parse_mode = "HTML"
+            sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+            if sent:
+                URL_STORE[sent[0].message_id] = url
+                return
+        elif ig_photos and len(ig_photos) == 1:
+            bot_msg = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=ig_photos[0],
+                caption=caption,
+                parse_mode="HTML"
+            )
+            if bot_msg:
                 URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 3. Video (TikTok, Reels, Twitter/X) tramite yt-dlp accelerato
+    # 3. Video (TikTok, Reels, X) tramite download nativo veloce
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(None, download_media, url, False)
@@ -188,9 +183,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if bot_msg:
             URL_STORE[bot_msg.message_id] = url
+            return
 
     except Exception as e:
-        logger.error(f"Errore download {url}: {e}")
+        logger.warning(f"Download nativo non riuscito, avvio fallback automatico: {e}")
+
+    # 4. Fallback pulito (se Meta o X bloccano il download del file)
+    # Genera la visualizzazione del post senza crash
+    fallback_url = url
+    if "instagram.com" in url:
+        fallback_url = re.sub(r'https?://(?:www\.)?instagram\.com/', 'https://www.ddinstagram.com/', url)
+    elif "tiktok.com" in url:
+        fallback_url = re.sub(r'https?://(?:vt|vm)\.tiktok\.com/', 'https://vm.tnktok.com/', url)
+    elif "twitter.com" in url or "x.com" in url:
+        fallback_url = re.sub(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/', 'https://vxtwitter.com/', url)
+
+    # Invia usando il link con anteprima automatica
+    bot_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{caption}\n{fallback_url}",
+        parse_mode="HTML",
+        disable_web_page_preview=False
+    )
+    if bot_msg:
+        URL_STORE[bot_msg.message_id] = url
 
 async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.reply_to_message
@@ -265,7 +281,7 @@ def main():
     app.add_handler(CommandHandler("link", get_link))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Media Downloader ultra-veloce operativo!")
+    print("Media Bot definitivo attivo!")
     app.run_polling()
 
 if __name__ == "__main__":
