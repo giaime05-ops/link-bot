@@ -4,19 +4,27 @@ import logging
 import asyncio
 from pathlib import Path
 import http.cookiejar
+from datetime import datetime, timezone
 import requests
+import subprocess
 
 import static_ffmpeg
 static_ffmpeg.add_paths()
 
 import yt_dlp
 import instaloader
-from telegram import Update, InputMediaPhoto
+from telegram import (
+    Update,
+    InputMediaPhoto,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     MessageHandler,
     CommandHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes
 )
@@ -29,7 +37,11 @@ DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COOKIE_FILE = "cookies.txt"
 
+# Mapping: message_id -> url
 URL_STORE = {}
+
+# Memoria repost: clean_url -> {"sender": "@username", "date": datetime}
+REPOST_STORE = {}
 
 L = instaloader.Instaloader(
     download_pictures=False,
@@ -66,22 +78,27 @@ def extract_instagram_shortcode(url: str) -> str:
     m = re.search(r'instagram\.com/(?:p|reel|tv)/([^/?#&]+)', url)
     return m.group(1) if m else None
 
-def get_instagram_photos(shortcode: str):
+def get_instagram_photos_and_owner(shortcode: str):
+    """Estrae foto e autore per i post/caroselli di Instagram."""
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
+        owner = post.owner_username
         if post.is_video:
-            return None
+            return None, owner
 
         if post.mediacount > 1:
             photos = [node.display_url for node in post.get_sidecar_nodes() if not node.is_video]
-            return photos if photos else None
+            return (photos if photos else None), owner
 
-        return [post.url]
+        return [post.url], owner
     except Exception as e:
         logger.warning(f"Errore Instaloader: {e}")
-        return None
+        return None, None
 
-def get_twitter_photos_and_text(url: str):
+def get_twitter_data(url: str):
+    """
+    Estrae foto, testo del tweet e autore (@username) via endpoint API vxtwitter.
+    """
     try:
         clean_url = url.replace("https://x.com/", "https://api.vxtwitter.com/").replace("https://twitter.com/", "https://api.vxtwitter.com/")
         resp = requests.get(clean_url, timeout=10)
@@ -90,16 +107,15 @@ def get_twitter_photos_and_text(url: str):
             media_urls = data.get("mediaURLs", [])
             photos = [u for u in media_urls if not (u.endswith(".mp4") or ".mp4" in u or ".m3u8" in u)]
             text = data.get("text", "")
-            if photos:
-                return photos, text
+            user_handle = data.get("user_screen_name")
+            return photos, text, user_handle
     except Exception as e:
-        logger.warning(f"Errore fallback foto Twitter: {e}")
-    return None, None
+        logger.warning(f"Errore API Twitter: {e}")
+    return None, None, None
 
-def get_tiktok_photos(url: str):
+def get_tiktok_photos_and_author(url: str):
     """
-    Risolve i caroselli fotografici di TikTok (endpoint /photo/) tramite TikWM.
-    Restituisce la lista di immagini se si tratta di uno slideshow.
+    Estrae immagini e autore dei post carosello TikTok via TikWM.
     """
     try:
         api_url = "https://www.tikwm.com/api/"
@@ -109,11 +125,12 @@ def get_tiktok_photos(url: str):
             if res.get("code") == 0:
                 data = res.get("data", {})
                 images = data.get("images", [])
+                author = data.get("author", {}).get("unique_id")
                 if images:
-                    return images
+                    return images, author
     except Exception as e:
         logger.warning(f"Errore fallback TikTok photo: {e}")
-    return None
+    return None, None
 
 def download_video_or_audio(url: str, audio_only: bool = False):
     ydl_opts = {
@@ -144,6 +161,87 @@ def download_video_or_audio(url: str, audio_only: bool = False):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=True)
 
+def compress_video_if_needed(file_path: Path) -> Path:
+    size_mb = file_path.stat().st_size / (1024 * 1024)
+    if size_mb <= 48:
+        return file_path
+
+    compressed_path = file_path.with_name(f"comp_{file_path.name}")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(file_path),
+        "-vf", "scale=-2:720",
+        "-c:v", "libx264", "-crf", "28", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k",
+        str(compressed_path)
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        file_path.unlink(missing_ok=True)
+        return compressed_path
+    except Exception as e:
+        logger.warning(f"Compressione fallita: {e}")
+        return file_path
+
+def create_gif_clip(video_path: Path, start_sec: float, duration: float, out_path: Path):
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(start_sec), "-t", str(duration),
+        "-i", str(video_path),
+        "-an",
+        "-vf", "scale=-2:480",
+        "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+        str(out_path)
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+def build_repost_notice_and_update(url: str, sender_name: str) -> str:
+    clean_url = url.lower().rstrip('/')
+    now = datetime.now(timezone.utc)
+    repost_text = ""
+
+    if clean_url in REPOST_STORE:
+        prev = REPOST_STORE[clean_url]
+        diff = now - prev["date"]
+        days = diff.days
+        hours = int(diff.seconds / 3600)
+        
+        if days > 0:
+            time_ago = f"{days} giorn{'o' if days == 1 else 'i'} fa"
+        elif hours > 0:
+            time_ago = f"{hours} or{'a' if hours == 1 else 'e'} fa"
+        else:
+            time_ago = "poco fa"
+
+        repost_text = f"⚠️ <b>Repost!</b> Già inviato da <b>{prev['sender']}</b> {time_ago}\n"
+
+    REPOST_STORE[clean_url] = {"sender": sender_name, "date": now}
+    return repost_text
+
+def format_caption(repost_prefix: str, sender_name: str, author: str = None, extra_text: str = None) -> str:
+    """Formatta la didascalia con autore del post, mittente ed eventuale testo."""
+    parts = []
+    if repost_prefix:
+        parts.append(repost_prefix.strip())
+    if extra_text:
+        parts.append(f"💬 <i>{extra_text}</i>\n")
+    
+    meta_line = []
+    if author:
+        meta_line.append(f"📱 <b>@{author.lstrip('@')}</b>")
+    meta_line.append(f"👤 Inviato da <b>{sender_name}</b>")
+    
+    parts.append(" | ".join(meta_line) if author else meta_line[0])
+    return "\n".join(parts)
+
+def get_action_keyboard(url: str) -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("🎵 Audio", callback_data="get_audio_inline"),
+            InlineKeyboardButton("🔗 Link", url=url)
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -162,15 +260,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
+    repost_prefix = build_repost_notice_and_update(url, sender_name)
     loop = asyncio.get_running_loop()
 
-    # 1. Caroselli / Foto Instagram
-    if "instagram.com" in url and ("/p/" in url or "/reel/" not in url):
+    # 1. Caroselli / Foto Instagram (Escluse le storie che vanno al downloader video/storie)
+    if "instagram.com" in url and ("/p/" in url or "/reel/" not in url) and "/stories/" not in url:
         shortcode = extract_instagram_shortcode(url)
         if shortcode:
-            photos = await loop.run_in_executor(None, get_instagram_photos, shortcode)
+            photos, author = await loop.run_in_executor(None, get_instagram_photos_and_owner, shortcode)
             if photos:
-                caption = f"👤 Inviato da <b>{sender_name}</b>"
+                caption = format_caption(repost_prefix, sender_name, author=author)
                 if len(photos) > 1:
                     media_group = [
                         InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
@@ -187,17 +286,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=chat_id,
                         photo=photos[0],
                         caption=caption,
-                        parse_mode="HTML"
+                        parse_mode="HTML",
+                        reply_markup=get_action_keyboard(url)
                     )
                     if bot_msg:
                         URL_STORE[bot_msg.message_id] = url
                     return
 
-    # 2. Controllo Foto e Caroselli TikTok
+    # 2. Foto e Caroselli TikTok
     if "tiktok.com" in url:
-        tiktok_photos = await loop.run_in_executor(None, get_tiktok_photos, url)
+        tiktok_photos, tk_author = await loop.run_in_executor(None, get_tiktok_photos_and_author, url)
         if tiktok_photos:
-            caption = f"👤 Inviato da <b>{sender_name}</b>"
+            caption = format_caption(repost_prefix, sender_name, author=tk_author)
             if len(tiktok_photos) > 1:
                 media_group = [
                     InputMediaPhoto(media=tiktok_photos[0], caption=caption, parse_mode="HTML")
@@ -214,22 +314,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     photo=tiktok_photos[0],
                     caption=caption,
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=get_action_keyboard(url)
                 )
                 if bot_msg:
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 3. Controllo Foto X / Twitter
+    # 3. Twitter / X (Foto, Galleria o SOLO TESTO)
     if "twitter.com" in url or "x.com" in url:
-        photos, tweet_text = await loop.run_in_executor(None, get_twitter_photos_and_text, url)
+        photos, tweet_text, tw_author = await loop.run_in_executor(None, get_twitter_data, url)
+        clean_tweet = re.sub(r'https?://\S+', '', tweet_text or "").strip() if tweet_text else None
+        
+        # Se ci sono foto
         if photos:
-            clean_tweet = re.sub(r'https?://\S+', '', tweet_text or "").strip()
-            if clean_tweet:
-                caption = f"💬 <i>{clean_tweet}</i>\n\n👤 Inviato da <b>{sender_name}</b>"
-            else:
-                caption = f"👤 Inviato da <b>{sender_name}</b>"
-
+            caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=clean_tweet)
             if len(photos) > 1:
                 media_group = [
                     InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
@@ -246,51 +345,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     photo=photos[0],
                     caption=caption,
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=get_action_keyboard(url)
+                )
+                if bot_msg:
+                    URL_STORE[bot_msg.message_id] = url
+                return
+        
+        # Se non ci sono foto ed è un tweet di solo testo (nessun video nei metadati)
+        elif clean_tweet and "video" not in str(photos):
+            # Prova veloce per vedere se è un tweet puramente testuale
+            caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=clean_tweet)
+            # Verifica che non sia un video prima di mandare come solo testo
+            try:
+                info_check = await loop.run_in_executor(None, download_video_or_audio, url, False)
+                # Se yt-dlp trova un video lo lascerà gestire al blocco 4, altrimenti prosegue
+            except Exception:
+                # Nessun video trovato -> è un tweet di solo testo!
+                link_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Apri su X", url=url)]])
+                bot_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=caption,
+                    parse_mode="HTML",
+                    reply_markup=link_btn
                 )
                 if bot_msg:
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 4. Download Video standard (TikTok video, Reels, Twitter/X video)
+    # 4. Download Video, Reels, TikTok e Storie Instagram
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, False)
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
 
+        # Recupera autore originale dai metadati yt-dlp
+        media_author = info.get('uploader') or info.get('channel') or info.get('uploader_id')
+
         is_twitter = ("twitter.com" in url or "x.com" in url)
         tweet_text = info.get('description') or info.get('title') or ""
+        extra_desc = None
 
         if is_twitter and tweet_text and tweet_text != file_id:
-            clean_tweet = re.sub(r'https?://\S+', '', tweet_text).strip()
-            if clean_tweet:
-                caption = f"💬 <i>{clean_tweet}</i>\n\n👤 Inviato da <b>{sender_name}</b>"
-            else:
-                caption = f"👤 Inviato da <b>{sender_name}</b>"
-        else:
-            caption = f"👤 Inviato da <b>{sender_name}</b>"
+            clean_tw = re.sub(r'https?://\S+', '', tweet_text).strip()
+            if clean_tw:
+                extra_desc = clean_tw
+
+        caption = format_caption(repost_prefix, sender_name, author=media_author, extra_text=extra_desc)
 
         bot_msg = None
         if files:
             actual_file = files[0]
             ext = actual_file.suffix.lower().replace('.', '')
-            with open(actual_file, 'rb') as f:
-                if ext in ['jpg', 'jpeg', 'png', 'webp']:
+            if ext in ['jpg', 'jpeg', 'png', 'webp']:
+                with open(actual_file, 'rb') as f:
                     bot_msg = await context.bot.send_photo(
                         chat_id=chat_id,
                         photo=f,
                         caption=caption,
-                        parse_mode="HTML"
+                        parse_mode="HTML",
+                        reply_markup=get_action_keyboard(url)
                     )
-                else:
+                actual_file.unlink(missing_ok=True)
+            else:
+                final_file = await loop.run_in_executor(None, compress_video_if_needed, actual_file)
+                with open(final_file, 'rb') as f:
                     bot_msg = await context.bot.send_video(
                         chat_id=chat_id,
                         video=f,
                         caption=caption,
                         parse_mode="HTML",
-                        supports_streaming=True
+                        supports_streaming=True,
+                        reply_markup=get_action_keyboard(url)
                     )
-            actual_file.unlink(missing_ok=True)
+                final_file.unlink(missing_ok=True)
 
         if bot_msg:
             URL_STORE[bot_msg.message_id] = url
@@ -303,6 +431,110 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="⚠️ Impossibile scaricare il contenuto da questo link.",
             parse_mode="HTML"
         )
+
+async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.data != "get_audio_inline":
+        return
+
+    msg_id = query.message.message_id
+    user = query.from_user
+
+    if msg_id not in URL_STORE:
+        await query.answer("Post non più disponibile.", show_alert=True)
+        return
+
+    url = URL_STORE[msg_id]
+    await query.answer("🎵 Invio traccia audio in chat privata...")
+
+    loop = asyncio.get_running_loop()
+    try:
+        info = await loop.run_in_executor(None, download_video_or_audio, url, True)
+        file_id = info.get('id')
+        audio_files = list(DOWNLOAD_DIR.glob(f"{file_id}.mp3"))
+
+        if audio_files:
+            with open(audio_files[0], 'rb') as f:
+                await context.bot.send_audio(
+                    chat_id=user.id,
+                    audio=f,
+                    caption="🎵 Traccia audio estratta!"
+                )
+            audio_files[0].unlink(missing_ok=True)
+        else:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="ℹ️ Questo post non contiene alcuna traccia audio."
+            )
+    except Forbidden:
+        bot_info = await context.bot.get_me()
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"⚠️ {user.mention_html()}, avvia il bot in privato (t.me/{bot_info.username}) per ricevere l'audio!",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Errore estrazione audio inline: {e}")
+
+async def handle_gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reply = update.message.reply_to_message
+    if not reply or reply.message_id not in URL_STORE:
+        return
+
+    url = URL_STORE[reply.message_id]
+    chat_id = update.message.chat_id
+
+    args = context.args
+    start_sec = 0.0
+    duration = 5.0
+
+    if args:
+        raw_text = " ".join(args).replace('-', ' ')
+        parts = re.findall(r'\d+(?:\.\d+)?', raw_text)
+        if len(parts) >= 2:
+            s = float(parts[0])
+            e = float(parts[1])
+            if e > s:
+                start_sec = s
+                duration = min(e - s, 10.0)
+        elif len(parts) == 1:
+            duration = min(float(parts[0]), 10.0)
+
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    loop = asyncio.get_running_loop()
+    try:
+        info = await loop.run_in_executor(None, download_video_or_audio, url, False)
+        file_id = info.get('id')
+        files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
+
+        if not files:
+            return
+
+        source_video = files[0]
+        ext = source_video.suffix.lower().replace('.', '')
+        if ext in ['jpg', 'jpeg', 'png', 'webp']:
+            source_video.unlink(missing_ok=True)
+            return
+
+        gif_path = DOWNLOAD_DIR / f"gif_{file_id}.mp4"
+        await loop.run_in_executor(None, create_gif_clip, source_video, start_sec, duration, gif_path)
+        source_video.unlink(missing_ok=True)
+
+        if gif_path.exists():
+            with open(gif_path, 'rb') as f:
+                await context.bot.send_animation(
+                    chat_id=chat_id,
+                    animation=f,
+                    reply_to_message_id=reply.message_id
+                )
+            gif_path.unlink(missing_ok=True)
+
+    except Exception as e:
+        logger.error(f"Errore creazione GIF: {e}")
 
 async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = update.message.reply_to_message
@@ -378,11 +610,15 @@ def main():
         raise ValueError("TELEGRAM_TOKEN mancante!")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
     app.add_handler(CommandHandler("audio", get_audio))
     app.add_handler(CommandHandler("link", get_link))
+    app.add_handler(CommandHandler("gif", handle_gif_command))
+    
+    app.add_handler(CallbackQueryHandler(handle_inline_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot avviato con supporto foto TikTok e Twitter attivo!")
+    print("Bot avviato con Storie, Tweet testuali, Autori e Comandi attivi!")
     app.run_polling()
 
 if __name__ == "__main__":
