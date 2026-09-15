@@ -7,6 +7,7 @@ import http.cookiejar
 from datetime import datetime, timezone
 import requests
 import subprocess
+from urllib.parse import quote
 
 import static_ffmpeg
 static_ffmpeg.add_paths()
@@ -82,7 +83,7 @@ def get_instagram_photos_and_owner(shortcode: str):
     """Estrae foto e autore per i post/caroselli di Instagram."""
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
-        owner = post.owner_username
+        owner = post.owner_username or post.owner_profile.full_name
         if post.is_video:
             return None, owner
 
@@ -95,9 +96,46 @@ def get_instagram_photos_and_owner(shortcode: str):
         logger.warning(f"Errore Instaloader: {e}")
         return None, None
 
+def get_instagram_story_fallback(url: str):
+    """Recupera foto da una storia Instagram tramite Instaloader se yt-dlp fallisce."""
+    try:
+        m = re.search(r'instagram\.com/stories/([^/?#&]+)/(\d+)', url)
+        if not m:
+            return None, None
+        username, media_id = m.group(1), int(m.group(2))
+        profile = instaloader.Profile.from_username(L.context, username)
+        for story in L.get_stories(userids=[profile.userid]):
+            for item in story.get_items():
+                if item.mediaid == media_id:
+                    return item.url, username
+    except Exception as e:
+        logger.warning(f"Errore fallback storia Instaloader: {e}")
+    return None, None
+
+def translate_to_italian_if_needed(text: str):
+    """
+    Traduce il testo in italiano tramite endpoint rapido di Google Translate se non lo è già.
+    """
+    if not text:
+        return text
+    try:
+        encoded = quote(text)
+        api = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=it&dt=t&q={encoded}"
+        res = requests.get(api, timeout=5).json()
+        translated_text = "".join([part[0] for part in res[0] if part[0]])
+        detected_lang = res[2] if len(res) > 2 else "it"
+        
+        # Se la lingua rilevata è diversa dall'italiano, mostriamo la traduzione
+        if detected_lang and not detected_lang.startswith("it"):
+            return f"{translated_text}\n<i>(Tradotto da {detected_lang.upper()})</i>"
+        return text
+    except Exception as e:
+        logger.warning(f"Errore traduzione automatica: {e}")
+        return text
+
 def get_twitter_data(url: str):
     """
-    Estrae foto, testo del tweet e autore (@username) via endpoint API vxtwitter.
+    Estrae foto, testo tradotto del tweet e autore via endpoint API vxtwitter.
     """
     try:
         clean_url = url.replace("https://x.com/", "https://api.vxtwitter.com/").replace("https://twitter.com/", "https://api.vxtwitter.com/")
@@ -106,9 +144,13 @@ def get_twitter_data(url: str):
             data = resp.json()
             media_urls = data.get("mediaURLs", [])
             photos = [u for u in media_urls if not (u.endswith(".mp4") or ".mp4" in u or ".m3u8" in u)]
-            text = data.get("text", "")
-            user_handle = data.get("user_screen_name")
-            return photos, text, user_handle
+            raw_text = data.get("text", "")
+            
+            clean_text = re.sub(r'https?://\S+', '', raw_text).strip() if raw_text else ""
+            translated = translate_to_italian_if_needed(clean_text) if clean_text else ""
+            
+            author_name = data.get("user_name") or data.get("user_screen_name")
+            return photos, translated, author_name
     except Exception as e:
         logger.warning(f"Errore API Twitter: {e}")
     return None, None, None
@@ -125,7 +167,7 @@ def get_tiktok_photos_and_author(url: str):
             if res.get("code") == 0:
                 data = res.get("data", {})
                 images = data.get("images", [])
-                author = data.get("author", {}).get("unique_id")
+                author = data.get("author", {}).get("nickname") or data.get("author", {}).get("unique_id")
                 if images:
                     return images, author
     except Exception as e:
@@ -218,19 +260,17 @@ def build_repost_notice_and_update(url: str, sender_name: str) -> str:
     return repost_text
 
 def format_caption(repost_prefix: str, sender_name: str, author: str = None, extra_text: str = None) -> str:
-    """Formatta la didascalia con autore del post, mittente ed eventuale testo."""
+    """Formatta la didascalia su righe separate ordinate, senza chiocciola rotta."""
     parts = []
     if repost_prefix:
         parts.append(repost_prefix.strip())
     if extra_text:
         parts.append(f"💬 <i>{extra_text}</i>\n")
-    
-    meta_line = []
     if author:
-        meta_line.append(f"📱 <b>@{author.lstrip('@')}</b>")
-    meta_line.append(f"👤 Inviato da <b>{sender_name}</b>")
+        clean_author = str(author).lstrip('@').strip()
+        parts.append(f"📱 <b>{clean_author}</b>")
     
-    parts.append(" | ".join(meta_line) if author else meta_line[0])
+    parts.append(f"👤 Inviato da <b>{sender_name}</b>")
     return "\n".join(parts)
 
 def get_action_keyboard(url: str) -> InlineKeyboardMarkup:
@@ -263,7 +303,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repost_prefix = build_repost_notice_and_update(url, sender_name)
     loop = asyncio.get_running_loop()
 
-    # 1. Caroselli / Foto Instagram (Escluse le storie che vanno al downloader video/storie)
+    # 1. Caroselli / Foto Instagram (Escluse le storie che vanno al downloader dedicato)
     if "instagram.com" in url and ("/p/" in url or "/reel/" not in url) and "/stories/" not in url:
         shortcode = extract_instagram_shortcode(url)
         if shortcode:
@@ -321,14 +361,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 3. Twitter / X (Foto, Galleria o SOLO TESTO)
+    # 3. Twitter / X (Foto, Galleria o SOLO TESTO con traduzione)
     if "twitter.com" in url or "x.com" in url:
         photos, tweet_text, tw_author = await loop.run_in_executor(None, get_twitter_data, url)
-        clean_tweet = re.sub(r'https?://\S+', '', tweet_text or "").strip() if tweet_text else None
         
         # Se ci sono foto
         if photos:
-            caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=clean_tweet)
+            caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=tweet_text)
             if len(photos) > 1:
                 media_group = [
                     InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
@@ -352,16 +391,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     URL_STORE[bot_msg.message_id] = url
                 return
         
-        # Se non ci sono foto ed è un tweet di solo testo (nessun video nei metadati)
-        elif clean_tweet and "video" not in str(photos):
-            # Prova veloce per vedere se è un tweet puramente testuale
-            caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=clean_tweet)
-            # Verifica che non sia un video prima di mandare come solo testo
+        # Se non ci sono foto ed è un tweet di solo testo
+        elif tweet_text and "video" not in str(photos):
             try:
-                info_check = await loop.run_in_executor(None, download_video_or_audio, url, False)
-                # Se yt-dlp trova un video lo lascerà gestire al blocco 4, altrimenti prosegue
+                # Se yt-dlp trova un video lo lasciamo al punto 4
+                await loop.run_in_executor(None, download_video_or_audio, url, False)
             except Exception:
-                # Nessun video trovato -> è un tweet di solo testo!
+                caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=tweet_text)
                 link_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Apri su X", url=url)]])
                 bot_msg = await context.bot.send_message(
                     chat_id=chat_id,
@@ -379,7 +415,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
 
-        # Recupera autore originale dai metadati yt-dlp
         media_author = info.get('uploader') or info.get('channel') or info.get('uploader_id')
 
         is_twitter = ("twitter.com" in url or "x.com" in url)
@@ -389,7 +424,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_twitter and tweet_text and tweet_text != file_id:
             clean_tw = re.sub(r'https?://\S+', '', tweet_text).strip()
             if clean_tw:
-                extra_desc = clean_tw
+                extra_desc = translate_to_italian_if_needed(clean_tw)
 
         caption = format_caption(repost_prefix, sender_name, author=media_author, extra_text=extra_desc)
 
@@ -425,6 +460,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     except Exception as e:
+        # Fallback specifico per le Storie fotografiche di Instagram
+        if "instagram.com/stories/" in url:
+            photo_url, story_author = await loop.run_in_executor(None, get_instagram_story_fallback, url)
+            if photo_url:
+                caption = format_caption(repost_prefix, sender_name, author=story_author)
+                bot_msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_url,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=get_action_keyboard(url)
+                )
+                if bot_msg:
+                    URL_STORE[bot_msg.message_id] = url
+                    return
+
         logger.error(f"Errore download {url}: {e}")
         await context.bot.send_message(
             chat_id=chat_id,
@@ -618,7 +669,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_inline_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot avviato con Storie, Tweet testuali, Autori e Comandi attivi!")
+    print("Bot avviato con layout migliorato, traduzione e storie foto attive!")
     app.run_polling()
 
 if __name__ == "__main__":
