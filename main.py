@@ -44,7 +44,7 @@ URL_STORE = {}
 # Memoria repost: clean_url -> {"sender": "@username", "date": datetime}
 REPOST_STORE = {}
 
-# Instaloader con tentativi = 1: se riceve un 429 NON SI METTE MAI IN PAUSA/SLEEP
+# FAIL-FAST: tentativi = 1, sleep = False (nessuna attesa in caso di 429)
 L = instaloader.Instaloader(
     download_pictures=False,
     download_videos=False,
@@ -82,7 +82,7 @@ def extract_instagram_shortcode(url: str) -> str:
     return m.group(1) if m else None
 
 def get_instagram_photos_and_owner(shortcode: str):
-    """Estrae foto e autore per i normali post/caroselli Instagram."""
+    """Estrae foto e autore per i normali post/caroselli Instagram senza retry lenti."""
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         owner = post.owner_username or (post.owner_profile.full_name if post.owner_profile else None)
@@ -95,8 +95,45 @@ def get_instagram_photos_and_owner(shortcode: str):
 
         return [post.url], owner
     except Exception as e:
-        logger.warning(f"Instaloader post check: {e}")
+        logger.warning(f"Instaloader post check fallito immediatamente: {e}")
         return None, None
+
+def get_single_story_media(url: str):
+    """
+    Recupera foto o video di una singola storia Instagram usando l'API mirata
+    con timeout rigido a 5 secondi per non bloccare mai il bot.
+    """
+    m = re.search(r'instagram\.com/stories/([^/?#&]+)/(\d+)', url)
+    if not m:
+        return None, None, None
+    
+    username = m.group(1)
+    media_id = m.group(2)
+    
+    try:
+        session = L.context._session
+        api_url = f"https://www.instagram.com/api/v1/media/{media_id}/info/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "X-IG-App-ID": "936619743392459",
+        }
+        res = session.get(api_url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            items = data.get("items", [])
+            if items:
+                item = items[0]
+                owner_name = item.get("user", {}).get("username") or username
+                if item.get("video_versions"):
+                    video_url = item["video_versions"][0]["url"]
+                    return "video", video_url, owner_name
+                elif item.get("image_versions2"):
+                    candidates = item["image_versions2"].get("candidates", [])
+                    if candidates:
+                        return "photo", candidates[0]["url"], owner_name
+    except Exception as e:
+        logger.warning(f"Errore recupero storia rapida: {e}")
+    return None, None, None
 
 def translate_to_italian_if_needed(text: str):
     if not text:
@@ -104,7 +141,7 @@ def translate_to_italian_if_needed(text: str):
     try:
         encoded = quote(text)
         api = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=it&dt=t&q={encoded}"
-        res = requests.get(api, timeout=5).json()
+        res = requests.get(api, timeout=4).json()
         translated_text = "".join([part[0] for part in res[0] if part[0]])
         detected_lang = res[2] if len(res) > 2 else "it"
         
@@ -118,7 +155,7 @@ def translate_to_italian_if_needed(text: str):
 def get_twitter_data(url: str):
     try:
         clean_url = url.replace("https://x.com/", "https://api.vxtwitter.com/").replace("https://twitter.com/", "https://api.vxtwitter.com/")
-        resp = requests.get(clean_url, timeout=10)
+        resp = requests.get(clean_url, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
             media_urls = data.get("mediaURLs", [])
@@ -137,7 +174,7 @@ def get_twitter_data(url: str):
 def get_tiktok_photos_and_author(url: str):
     try:
         api_url = "https://www.tikwm.com/api/"
-        resp = requests.post(api_url, data={"url": url}, timeout=10)
+        resp = requests.post(api_url, data={"url": url}, timeout=6)
         if resp.status_code == 200:
             res = resp.json()
             if res.get("code") == 0:
@@ -151,12 +188,19 @@ def get_tiktok_photos_and_author(url: str):
     return None, None
 
 def download_video_or_audio(url: str, audio_only: bool = False):
+    """
+    Downloader yt-dlp con FAIL-FAST: zero retries e timeout stretto (7s).
+    Non si blocca mai se un link è morto o irraggiungibile.
+    """
     ydl_opts = {
         'outtmpl': f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'concurrent_fragment_downloads': 5,
+        'retries': 0,
+        'fragment_retries': 0,
+        'socket_timeout': 7,
     }
 
     if os.path.exists(COOKIE_FILE) and "instagram.com" in url:
@@ -172,7 +216,6 @@ def download_video_or_audio(url: str, audio_only: bool = False):
             }],
         })
     else:
-        # Include 'best' generico così da accettare anche formati foto/storie
         ydl_opts.update({
             'format': 'best[ext=mp4]/bestvideo+bestaudio/best',
         })
@@ -279,7 +322,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repost_prefix = build_repost_notice_and_update(url, sender_name)
     loop = asyncio.get_running_loop()
 
-    # 1. Caroselli / Foto Instagram normali (escluse storie)
+    # 1. Storie Instagram (priorità immediata, senza code né pause)
+    if "instagram.com/stories/" in url:
+        media_type, media_url, story_author = await loop.run_in_executor(None, get_single_story_media, url)
+        if media_url:
+            caption = format_caption(repost_prefix, sender_name, author=story_author)
+            if media_type == "photo":
+                bot_msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=media_url,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=get_action_keyboard(url)
+                )
+                if bot_msg:
+                    URL_STORE[bot_msg.message_id] = url
+                return
+            elif media_type == "video":
+                bot_msg = await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=media_url,
+                    caption=caption,
+                    parse_mode="HTML",
+                    supports_streaming=True,
+                    reply_markup=get_action_keyboard(url)
+                )
+                if bot_msg:
+                    URL_STORE[bot_msg.message_id] = url
+                return
+
+    # 2. Caroselli / Foto Instagram normali
     if "instagram.com" in url and ("/p/" in url or "/reel/" not in url) and "/stories/" not in url:
         shortcode = extract_instagram_shortcode(url)
         if shortcode:
@@ -309,7 +381,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         URL_STORE[bot_msg.message_id] = url
                     return
 
-    # 2. Foto e Caroselli TikTok
+    # 3. Foto e Caroselli TikTok
     if "tiktok.com" in url:
         tiktok_photos, tk_author = await loop.run_in_executor(None, get_tiktok_photos_and_author, url)
         if tiktok_photos:
@@ -337,7 +409,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 3. Twitter / X (Foto, Galleria o solo testo)
+    # 4. Twitter / X (Foto, Galleria o Solo Testo)
     if "twitter.com" in url or "x.com" in url:
         photos, tweet_text, tw_author = await loop.run_in_executor(None, get_twitter_data, url)
         
@@ -382,9 +454,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 4. Download Video, Reels, TikTok e Storie (tramite yt-dlp)
+    # 5. Download Video standard (Reels, TikTok video, X video)
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, False)
+        if not info:
+            raise ValueError("Media info non disponibile")
+
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
 
@@ -433,7 +508,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     except Exception as e:
-        logger.error(f"Errore download {url}: {e}")
+        logger.error(f"Errore immediato download {url}: {e}")
         await context.bot.send_message(
             chat_id=chat_id,
             text="⚠️ Impossibile scaricare il contenuto da questo link.",
@@ -458,6 +533,8 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, True)
+        if not info:
+            raise ValueError("Impossibile recuperare audio")
         file_id = info.get('id')
         audio_files = list(DOWNLOAD_DIR.glob(f"{file_id}.mp3"))
 
@@ -478,7 +555,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bot_info = await context.bot.get_me()
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=f"⚠️ {user.mention_html()}, avvia il bot in privato (t.me/{bot_info.username}) per ricevere l'audio!",
+            text=f"⚠️ {user.mention_html()}, avvia prima il bot in privato (t.me/{bot_info.username}) per ricevere l'audio!",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -516,6 +593,8 @@ async def handle_gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, False)
+        if not info:
+            return
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
 
@@ -561,6 +640,8 @@ async def get_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         info = await loop.run_in_executor(None, download_video_or_audio, url, True)
+        if not info:
+            return
         file_id = info.get('id')
         audio_files = list(DOWNLOAD_DIR.glob(f"{file_id}.mp3"))
 
@@ -626,7 +707,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_inline_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot riavviato e protetto da rate limit 429!")
+    print("Bot riavviato: Fail-Fast attivo, timeout rigorosi e zero blocchi!")
     app.run_polling()
 
 if __name__ == "__main__":
