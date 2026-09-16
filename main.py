@@ -33,6 +33,9 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Silenzia i falsi allarmi sui micro-timeout temporanei di Telegram
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -44,7 +47,7 @@ URL_STORE = {}
 # Memoria repost: clean_url -> {"sender": "@username", "date": datetime}
 REPOST_STORE = {}
 
-# FAIL-FAST: tentativi = 1, sleep = False (nessuna attesa in caso di 429)
+# Instaloader configurato senza sleep/pause forzate
 L = instaloader.Instaloader(
     download_pictures=False,
     download_videos=False,
@@ -68,7 +71,7 @@ if os.path.exists(COOKIE_FILE):
 def extract_supported_url(text: str):
     patterns = [
         r'https?://(?:www\.)?instagram\.com/[^\s]+',
-        r'https?://[^\s]*tiktok\.com/[^\s]+',
+        r'https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+',
         r'https?://(?:www\.)?(?:twitter\.com|x\.com)/[^\s]+'
     ]
     for p in patterns:
@@ -82,7 +85,6 @@ def extract_instagram_shortcode(url: str) -> str:
     return m.group(1) if m else None
 
 def get_instagram_photos_and_owner(shortcode: str):
-    """Estrae foto e autore per i normali post/caroselli Instagram senza retry lenti."""
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         owner = post.owner_username or (post.owner_profile.full_name if post.owner_profile else None)
@@ -95,14 +97,10 @@ def get_instagram_photos_and_owner(shortcode: str):
 
         return [post.url], owner
     except Exception as e:
-        logger.warning(f"Instaloader post check fallito immediatamente: {e}")
+        logger.warning(f"Instaloader check fallito: {e}")
         return None, None
 
 def get_single_story_media(url: str):
-    """
-    Recupera foto o video di una singola storia Instagram usando l'API mirata
-    con timeout rigido a 5 secondi per non bloccare mai il bot.
-    """
     m = re.search(r'instagram\.com/stories/([^/?#&]+)/(\d+)', url)
     if not m:
         return None, None, None
@@ -117,7 +115,7 @@ def get_single_story_media(url: str):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "X-IG-App-ID": "936619743392459",
         }
-        res = session.get(api_url, headers=headers, timeout=5)
+        res = session.get(api_url, headers=headers, timeout=6)
         if res.status_code == 200:
             data = res.json()
             items = data.get("items", [])
@@ -125,14 +123,13 @@ def get_single_story_media(url: str):
                 item = items[0]
                 owner_name = item.get("user", {}).get("username") or username
                 if item.get("video_versions"):
-                    video_url = item["video_versions"][0]["url"]
-                    return "video", video_url, owner_name
+                    return "video", item["video_versions"][0]["url"], owner_name
                 elif item.get("image_versions2"):
                     candidates = item["image_versions2"].get("candidates", [])
                     if candidates:
                         return "photo", candidates[0]["url"], owner_name
     except Exception as e:
-        logger.warning(f"Errore recupero storia rapida: {e}")
+        logger.warning(f"Errore API storia diretta: {e}")
     return None, None, None
 
 def translate_to_italian_if_needed(text: str):
@@ -187,23 +184,45 @@ def get_tiktok_photos_and_author(url: str):
         logger.warning(f"Errore fallback TikTok photo: {e}")
     return None, None
 
-def download_video_or_audio(url: str, audio_only: bool = False):
-    """
-    Downloader yt-dlp con FAIL-FAST: zero retries e timeout stretto (7s).
-    Non si blocca mai se un link è morto o irraggiungibile.
-    """
+def download_tiktok_video_fallback(url: str):
+    """Fallback ad alta risoluzione per TikTok via API diretta."""
+    try:
+        api_url = "https://www.tikwm.com/api/"
+        resp = requests.post(api_url, data={"url": url}, timeout=8)
+        if resp.status_code == 200:
+            res = resp.json()
+            if res.get("code") == 0:
+                data = res.get("data", {})
+                video_url = data.get("play")
+                video_id = data.get("id", "tiktok_video")
+                author = data.get("author", {}).get("nickname") or data.get("author", {}).get("unique_id")
+                
+                if video_url:
+                    dest_file = DOWNLOAD_DIR / f"{video_id}.mp4"
+                    r = requests.get(video_url, timeout=15)
+                    if r.status_code == 200:
+                        with open(dest_file, "wb") as f:
+                            f.write(r.content)
+                        return {
+                            'id': video_id,
+                            'uploader': author
+                        }
+    except Exception as e:
+        logger.warning(f"Fallback TikTok video fallito: {e}")
+    return None
+
+def download_video_or_audio(url: str, audio_only: bool = False, use_cookies: bool = True):
     ydl_opts = {
         'outtmpl': f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'concurrent_fragment_downloads': 5,
-        'retries': 0,
-        'fragment_retries': 0,
-        'socket_timeout': 7,
+        'retries': 1,
+        'socket_timeout': 15,
     }
 
-    if os.path.exists(COOKIE_FILE) and "instagram.com" in url:
+    if use_cookies and os.path.exists(COOKIE_FILE) and "instagram.com" in url:
         ydl_opts['cookiefile'] = COOKIE_FILE
 
     if audio_only:
@@ -220,8 +239,15 @@ def download_video_or_audio(url: str, audio_only: bool = False):
             'format': 'best[ext=mp4]/bestvideo+bestaudio/best',
         })
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=True)
+    except Exception as e:
+        # Se fallisce con HTTP 400 Bad Request su Instagram ritenta immediatamente SENZA cookie
+        if use_cookies and "instagram.com" in url and "400" in str(e):
+            logger.info("Errore 400 rilevato con i cookies. Ritento download pubblico senza cookies...")
+            return download_video_or_audio(url, audio_only=audio_only, use_cookies=False)
+        raise e
 
 def compress_video_if_needed(file_path: Path) -> Path:
     size_mb = file_path.stat().st_size / (1024 * 1024)
@@ -322,7 +348,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repost_prefix = build_repost_notice_and_update(url, sender_name)
     loop = asyncio.get_running_loop()
 
-    # 1. Storie Instagram (priorità immediata, senza code né pause)
+    # 1. Storie Instagram
     if "instagram.com/stories/" in url:
         media_type, media_url, story_author = await loop.run_in_executor(None, get_single_story_media, url)
         if media_url:
@@ -351,7 +377,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 2. Caroselli / Foto Instagram normali
+    # 2. Caroselli / Foto Instagram
     if "instagram.com" in url and ("/p/" in url or "/reel/" not in url) and "/stories/" not in url:
         shortcode = extract_instagram_shortcode(url)
         if shortcode:
@@ -409,7 +435,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     URL_STORE[bot_msg.message_id] = url
                 return
 
-    # 4. Twitter / X (Foto, Galleria o Solo Testo)
+    # 4. Twitter / X
     if "twitter.com" in url or "x.com" in url:
         photos, tweet_text, tw_author = await loop.run_in_executor(None, get_twitter_data, url)
         
@@ -456,9 +482,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 5. Download Video standard (Reels, TikTok video, X video)
     try:
-        info = await loop.run_in_executor(None, download_video_or_audio, url, False)
-        if not info:
-            raise ValueError("Media info non disponibile")
+        info = None
+        try:
+            info = await loop.run_in_executor(None, download_video_or_audio, url, False)
+        except Exception as e_main:
+            if "tiktok.com" in url:
+                logger.info(f"yt-dlp fallito su TikTok ({e_main}), avvio fallback su TikWM...")
+                info = await loop.run_in_executor(None, download_tiktok_video_fallback, url)
+            if not info:
+                raise e_main
 
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
@@ -508,7 +540,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     except Exception as e:
-        logger.error(f"Errore immediato download {url}: {e}")
+        logger.error(f"Errore download {url}: {e}")
         await context.bot.send_message(
             chat_id=chat_id,
             text="⚠️ Impossibile scaricare il contenuto da questo link.",
@@ -698,7 +730,15 @@ def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN mancante!")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
     
     app.add_handler(CommandHandler("audio", get_audio))
     app.add_handler(CommandHandler("link", get_link))
@@ -707,8 +747,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_inline_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot riavviato: Fail-Fast attivo, timeout rigorosi e zero blocchi!")
-    app.run_polling()
+    print("Bot riavviato e pienamente operativo!")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
