@@ -33,18 +33,16 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Silenzia i falsi allarmi sui micro-timeout temporanei di Telegram
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+PROXY_URL = os.getenv("PROXY_URL", "").strip() # Legge il proxy da variabile d'ambiente se inserito
+
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COOKIE_FILE = "cookies.txt"
 
-# Mapping: message_id -> url
 URL_STORE = {}
-
-# Memoria repost: clean_url -> {"sender": "@username", "date": datetime}
 REPOST_STORE = {}
 
 L = instaloader.Instaloader(
@@ -220,6 +218,10 @@ def download_video_or_audio(url: str, audio_only: bool = False, use_cookies: boo
         'socket_timeout': 15,
     }
 
+    # Configura il proxy se presente nelle variabili d'ambiente
+    if PROXY_URL:
+        ydl_opts['proxy'] = PROXY_URL
+
     if use_cookies and os.path.exists(COOKIE_FILE) and "instagram.com" in url:
         ydl_opts['cookiefile'] = COOKIE_FILE
 
@@ -342,7 +344,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     repost_prefix = check_and_get_repost_notice(url)
     loop = asyncio.get_running_loop()
-    success_sent = False
 
     try:
         # 1. Storie Instagram
@@ -479,7 +480,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         err_msg = str(e).lower()
         logger.error(f"Errore download {url}: {e}")
         
-        # Diagnostica intelligente dell'errore per l'utente
         if "geo" in err_msg or "country" in err_msg or "not available" in err_msg:
             user_notice = "⚠️ Impossibile scaricare: il contenuto è geobloccato o non disponibile nella nazione del server."
         elif "private" in err_msg or "login" in err_msg or "401" in err_msg or "403" in err_msg:
@@ -695,8 +695,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_inline_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot riavviato con diagnostica errori dettagliata e fix repost!")
+    print("Bot riavviato con supporto Proxy italiano dinamico!")
     app.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
+if __name__ == "main__":
     main()
