@@ -47,7 +47,6 @@ URL_STORE = {}
 # Memoria repost: clean_url -> {"sender": "@username", "date": datetime}
 REPOST_STORE = {}
 
-# Instaloader configurato senza sleep/pause forzate
 L = instaloader.Instaloader(
     download_pictures=False,
     download_videos=False,
@@ -185,7 +184,6 @@ def get_tiktok_photos_and_author(url: str):
     return None, None
 
 def download_tiktok_video_fallback(url: str):
-    """Fallback ad alta risoluzione per TikTok via API diretta."""
     try:
         api_url = "https://www.tikwm.com/api/"
         resp = requests.post(api_url, data={"url": url}, timeout=8)
@@ -243,9 +241,7 @@ def download_video_or_audio(url: str, audio_only: bool = False, use_cookies: boo
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=True)
     except Exception as e:
-        # Se fallisce con HTTP 400 Bad Request su Instagram ritenta immediatamente SENZA cookie
         if use_cookies and "instagram.com" in url and "400" in str(e):
-            logger.info("Errore 400 rilevato con i cookies. Ritento download pubblico senza cookies...")
             return download_video_or_audio(url, audio_only=audio_only, use_cookies=False)
         raise e
 
@@ -282,14 +278,11 @@ def create_gif_clip(video_path: Path, start_sec: float, duration: float, out_pat
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-def build_repost_notice_and_update(url: str, sender_name: str) -> str:
+def check_and_get_repost_notice(url: str) -> str:
     clean_url = url.lower().rstrip('/')
-    now = datetime.now(timezone.utc)
-    repost_text = ""
-
     if clean_url in REPOST_STORE:
         prev = REPOST_STORE[clean_url]
-        diff = now - prev["date"]
+        diff = datetime.now(timezone.utc) - prev["date"]
         days = diff.days
         hours = int(diff.seconds / 3600)
         
@@ -300,10 +293,12 @@ def build_repost_notice_and_update(url: str, sender_name: str) -> str:
         else:
             time_ago = "poco fa"
 
-        repost_text = f"⚠️ <b>Repost!</b> Già inviato da <b>{prev['sender']}</b> {time_ago}\n"
+        return f"⚠️ <b>Repost!</b> Già inviato da <b>{prev['sender']}</b> {time_ago}\n"
+    return ""
 
-    REPOST_STORE[clean_url] = {"sender": sender_name, "date": now}
-    return repost_text
+def save_repost_record(url: str, sender_name: str):
+    clean_url = url.lower().rstrip('/')
+    REPOST_STORE[clean_url] = {"sender": sender_name, "date": datetime.now(timezone.utc)}
 
 def format_caption(repost_prefix: str, sender_name: str, author: str = None, extra_text: str = None) -> str:
     parts = []
@@ -345,162 +340,116 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
-    repost_prefix = build_repost_notice_and_update(url, sender_name)
+    repost_prefix = check_and_get_repost_notice(url)
     loop = asyncio.get_running_loop()
+    success_sent = False
 
-    # 1. Storie Instagram
-    if "instagram.com/stories/" in url:
-        media_type, media_url, story_author = await loop.run_in_executor(None, get_single_story_media, url)
-        if media_url:
-            caption = format_caption(repost_prefix, sender_name, author=story_author)
-            if media_type == "photo":
-                bot_msg = await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=media_url,
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=get_action_keyboard(url)
-                )
+    try:
+        # 1. Storie Instagram
+        if "instagram.com/stories/" in url:
+            media_type, media_url, story_author = await loop.run_in_executor(None, get_single_story_media, url)
+            if media_url:
+                caption = format_caption(repost_prefix, sender_name, author=story_author)
+                if media_type == "photo":
+                    bot_msg = await context.bot.send_photo(chat_id=chat_id, photo=media_url, caption=caption, parse_mode="HTML", reply_markup=get_action_keyboard(url))
+                else:
+                    bot_msg = await context.bot.send_video(chat_id=chat_id, video=media_url, caption=caption, parse_mode="HTML", supports_streaming=True, reply_markup=get_action_keyboard(url))
+                
                 if bot_msg:
                     URL_STORE[bot_msg.message_id] = url
-                return
-            elif media_type == "video":
-                bot_msg = await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=media_url,
-                    caption=caption,
-                    parse_mode="HTML",
-                    supports_streaming=True,
-                    reply_markup=get_action_keyboard(url)
-                )
-                if bot_msg:
-                    URL_STORE[bot_msg.message_id] = url
-                return
+                    save_repost_record(url, sender_name)
+                    return
 
-    # 2. Caroselli / Foto Instagram
-    if "instagram.com" in url and ("/p/" in url or "/reel/" not in url) and "/stories/" not in url:
-        shortcode = extract_instagram_shortcode(url)
-        if shortcode:
-            photos, author = await loop.run_in_executor(None, get_instagram_photos_and_owner, shortcode)
-            if photos:
-                caption = format_caption(repost_prefix, sender_name, author=author)
-                if len(photos) > 1:
-                    media_group = [
-                        InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
-                    ] + [
-                        InputMediaPhoto(media=u) for u in photos[1:10]
-                    ]
+        # 2. Caroselli / Foto Instagram
+        if "instagram.com" in url and ("/p/" in url or "/reel/" not in url) and "/stories/" not in url:
+            shortcode = extract_instagram_shortcode(url)
+            if shortcode:
+                photos, author = await loop.run_in_executor(None, get_instagram_photos_and_owner, shortcode)
+                if photos:
+                    caption = format_caption(repost_prefix, sender_name, author=author)
+                    if len(photos) > 1:
+                        media_group = [InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")] + [InputMediaPhoto(media=u) for u in photos[1:10]]
+                        sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+                        if sent:
+                            for msg in sent:
+                                URL_STORE[msg.message_id] = url
+                            save_repost_record(url, sender_name)
+                            return
+                    elif len(photos) == 1:
+                        bot_msg = await context.bot.send_photo(chat_id=chat_id, photo=photos[0], caption=caption, parse_mode="HTML", reply_markup=get_action_keyboard(url))
+                        if bot_msg:
+                            URL_STORE[bot_msg.message_id] = url
+                            save_repost_record(url, sender_name)
+                            return
+
+        # 3. Foto e Caroselli TikTok
+        if "tiktok.com" in url:
+            tiktok_photos, tk_author = await loop.run_in_executor(None, get_tiktok_photos_and_author, url)
+            if tiktok_photos:
+                caption = format_caption(repost_prefix, sender_name, author=tk_author)
+                if len(tiktok_photos) > 1:
+                    media_group = [InputMediaPhoto(media=tiktok_photos[0], caption=caption, parse_mode="HTML")] + [InputMediaPhoto(media=u) for u in tiktok_photos[1:10]]
                     sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
                     if sent:
                         for msg in sent:
                             URL_STORE[msg.message_id] = url
-                    return
-                elif len(photos) == 1:
-                    bot_msg = await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=photos[0],
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_markup=get_action_keyboard(url)
-                    )
+                        save_repost_record(url, sender_name)
+                        return
+                elif len(tiktok_photos) == 1:
+                    bot_msg = await context.bot.send_photo(chat_id=chat_id, photo=tiktok_photos[0], caption=caption, parse_mode="HTML", reply_markup=get_action_keyboard(url))
                     if bot_msg:
                         URL_STORE[bot_msg.message_id] = url
-                    return
+                        save_repost_record(url, sender_name)
+                        return
 
-    # 3. Foto e Caroselli TikTok
-    if "tiktok.com" in url:
-        tiktok_photos, tk_author = await loop.run_in_executor(None, get_tiktok_photos_and_author, url)
-        if tiktok_photos:
-            caption = format_caption(repost_prefix, sender_name, author=tk_author)
-            if len(tiktok_photos) > 1:
-                media_group = [
-                    InputMediaPhoto(media=tiktok_photos[0], caption=caption, parse_mode="HTML")
-                ] + [
-                    InputMediaPhoto(media=u) for u in tiktok_photos[1:10]
-                ]
-                sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-                if sent:
-                    for msg in sent:
-                        URL_STORE[msg.message_id] = url
-                return
-            elif len(tiktok_photos) == 1:
-                bot_msg = await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=tiktok_photos[0],
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=get_action_keyboard(url)
-                )
-                if bot_msg:
-                    URL_STORE[bot_msg.message_id] = url
-                return
-
-    # 4. Twitter / X
-    if "twitter.com" in url or "x.com" in url:
-        photos, tweet_text, tw_author = await loop.run_in_executor(None, get_twitter_data, url)
-        
-        if photos:
-            caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=tweet_text)
-            if len(photos) > 1:
-                media_group = [
-                    InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
-                ] + [
-                    InputMediaPhoto(media=u) for u in photos[1:10]
-                ]
-                sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-                if sent:
-                    for msg in sent:
-                        URL_STORE[msg.message_id] = url
-                return
-            elif len(photos) == 1:
-                bot_msg = await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photos[0],
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=get_action_keyboard(url)
-                )
-                if bot_msg:
-                    URL_STORE[bot_msg.message_id] = url
-                return
-        
-        elif tweet_text and "video" not in str(photos):
-            try:
-                await loop.run_in_executor(None, download_video_or_audio, url, False)
-            except Exception:
+        # 4. Twitter / X
+        if "twitter.com" in url or "x.com" in url:
+            photos, tweet_text, tw_author = await loop.run_in_executor(None, get_twitter_data, url)
+            if photos:
                 caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=tweet_text)
-                link_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Apri su X", url=url)]])
-                bot_msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=caption,
-                    parse_mode="HTML",
-                    reply_markup=link_btn
-                )
-                if bot_msg:
-                    URL_STORE[bot_msg.message_id] = url
-                return
+                if len(photos) > 1:
+                    media_group = [InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")] + [InputMediaPhoto(media=u) for u in photos[1:10]]
+                    sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+                    if sent:
+                        for msg in sent:
+                            URL_STORE[msg.message_id] = url
+                        save_repost_record(url, sender_name)
+                        return
+                elif len(photos) == 1:
+                    bot_msg = await context.bot.send_photo(chat_id=chat_id, photo=photos[0], caption=caption, parse_mode="HTML", reply_markup=get_action_keyboard(url))
+                    if bot_msg:
+                        URL_STORE[bot_msg.message_id] = url
+                        save_repost_record(url, sender_name)
+                        return
+            elif tweet_text:
+                try:
+                    await loop.run_in_executor(None, download_video_or_audio, url, False)
+                except Exception:
+                    caption = format_caption(repost_prefix, sender_name, author=tw_author, extra_text=tweet_text)
+                    link_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Apri su X", url=url)]])
+                    bot_msg = await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=link_btn)
+                    if bot_msg:
+                        URL_STORE[bot_msg.message_id] = url
+                        save_repost_record(url, sender_name)
+                        return
 
-    # 5. Download Video standard (Reels, TikTok video, X video)
-    try:
+        # 5. Download Video Standard
         info = None
         try:
             info = await loop.run_in_executor(None, download_video_or_audio, url, False)
         except Exception as e_main:
             if "tiktok.com" in url:
-                logger.info(f"yt-dlp fallito su TikTok ({e_main}), avvio fallback su TikWM...")
                 info = await loop.run_in_executor(None, download_tiktok_video_fallback, url)
             if not info:
                 raise e_main
 
         file_id = info.get('id')
         files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
-
         media_author = info.get('uploader') or info.get('channel') or info.get('uploader_id')
 
         is_twitter = ("twitter.com" in url or "x.com" in url)
         tweet_text = info.get('description') or info.get('title') or ""
         extra_desc = None
-
         if is_twitter and tweet_text and tweet_text != file_id:
             clean_tw = re.sub(r'https?://\S+', '', tweet_text).strip()
             if clean_tw:
@@ -514,36 +463,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ext = actual_file.suffix.lower().replace('.', '')
             if ext in ['jpg', 'jpeg', 'png', 'webp']:
                 with open(actual_file, 'rb') as f:
-                    bot_msg = await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=f,
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_markup=get_action_keyboard(url)
-                    )
+                    bot_msg = await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML", reply_markup=get_action_keyboard(url))
                 actual_file.unlink(missing_ok=True)
             else:
                 final_file = await loop.run_in_executor(None, compress_video_if_needed, actual_file)
                 with open(final_file, 'rb') as f:
-                    bot_msg = await context.bot.send_video(
-                        chat_id=chat_id,
-                        video=f,
-                        caption=caption,
-                        parse_mode="HTML",
-                        supports_streaming=True,
-                        reply_markup=get_action_keyboard(url)
-                    )
+                    bot_msg = await context.bot.send_video(chat_id=chat_id, video=f, caption=caption, parse_mode="HTML", supports_streaming=True, reply_markup=get_action_keyboard(url))
                 final_file.unlink(missing_ok=True)
 
         if bot_msg:
             URL_STORE[bot_msg.message_id] = url
-            return
+            save_repost_record(url, sender_name)
 
     except Exception as e:
+        err_msg = str(e).lower()
         logger.error(f"Errore download {url}: {e}")
+        
+        # Diagnostica intelligente dell'errore per l'utente
+        if "geo" in err_msg or "country" in err_msg or "not available" in err_msg:
+            user_notice = "⚠️ Impossibile scaricare: il contenuto è geobloccato o non disponibile nella nazione del server."
+        elif "private" in err_msg or "login" in err_msg or "401" in err_msg or "403" in err_msg:
+            user_notice = "⚠️ Impossibile scaricare: l'account o il contenuto è privato."
+        elif "extractor" in err_msg or "sign in" in err_msg or "unavailable" in err_msg:
+            user_notice = "⚠️ Impossibile scaricare: il link non esiste, è scaduto o protetto da copyright."
+        else:
+            user_notice = "⚠️ Impossibile scaricare il contenuto da questo link."
+
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Impossibile scaricare il contenuto da questo link.",
+            text=user_notice,
             parse_mode="HTML"
         )
 
@@ -747,7 +695,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_inline_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot riavviato e pienamente operativo!")
+    print("Bot riavviato con diagnostica errori dettagliata e fix repost!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
