@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PROXY_URL = os.getenv("PROXY_URL", "").strip() # Legge il proxy da variabile d'ambiente se inserito
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -218,7 +218,6 @@ def download_video_or_audio(url: str, audio_only: bool = False, use_cookies: boo
         'socket_timeout': 15,
     }
 
-    # Configura il proxy se presente nelle variabili d'ambiente
     if PROXY_URL:
         ydl_opts['proxy'] = PROXY_URL
 
@@ -346,7 +345,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
 
     try:
-        # 1. Storie Instagram
         if "instagram.com/stories/" in url:
             media_type, media_url, story_author = await loop.run_in_executor(None, get_single_story_media, url)
             if media_url:
@@ -361,7 +359,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     save_repost_record(url, sender_name)
                     return
 
-        # 2. Caroselli / Foto Instagram
         if "instagram.com" in url and ("/p/" in url or "/reel/" not in url) and "/stories/" not in url:
             shortcode = extract_instagram_shortcode(url)
             if shortcode:
@@ -383,7 +380,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             save_repost_record(url, sender_name)
                             return
 
-        # 3. Foto e Caroselli TikTok
         if "tiktok.com" in url:
             tiktok_photos, tk_author = await loop.run_in_executor(None, get_tiktok_photos_and_author, url)
             if tiktok_photos:
@@ -403,7 +399,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         save_repost_record(url, sender_name)
                         return
 
-        # 4. Twitter / X
         if "twitter.com" in url or "x.com" in url:
             photos, tweet_text, tw_author = await loop.run_in_executor(None, get_twitter_data, url)
             if photos:
@@ -434,7 +429,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         save_repost_record(url, sender_name)
                         return
 
-        # 5. Download Video Standard
         info = None
         try:
             info = await loop.run_in_executor(None, download_video_or_audio, url, False)
@@ -657,7 +651,7 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
-    if not reply or reply.message_id not in URL_STORE:
+    if not reply or reply.message_id not in URL_`STORE`:
         return
 
     url = URL_STORE[reply.message_id]
@@ -695,8 +689,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_inline_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot riavviato con supporto Proxy italiano dinamico!")
+    print("Bot avviato correttamente con supporto Proxy!")
     app.run_polling(drop_pending_updates=True)
 
-if __name__ == "main__":
+if __name__ == "__main__":
     main()
