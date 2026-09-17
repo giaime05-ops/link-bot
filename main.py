@@ -651,7 +651,7 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
-    if not reply or reply.message_id not in URL_`STORE`:
+    if not reply or reply.message_id not in URL_STORE:
         return
 
     url = URL_STORE[reply.message_id]
